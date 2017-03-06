@@ -1,0 +1,2193 @@
+CREATE OR REPLACE PACKAGE UTL_CONVERT AS
+
+   FUNCTION base64_string_to_clob (p_clob CLOB) RETURN CLOB;
+
+   function long_to_clob( ent_rowid IN ROWID,ent_tabla IN VARCHAR2,ent_campo in varchar2) return clob;
+
+END UTL_CONVERT;
+/
+CREATE OR REPLACE PACKAGE BODY UTL_CONVERT AS
+------------------------------------------------------
+---Funciton que pasa de base64 a clob
+------------------------------------------------------  
+    FUNCTION base64_string_to_clob (p_clob CLOB) RETURN CLOB  IS
+        l_chunk CLOB; --Chunks of decoded blob that'll be appended
+        l_result CLOB; --Final blob result to be returned
+        l_rawout RAW (32767); --Decoded raw data from first pass decode
+        l_rawin RAW (32767); --Encoded raw data chunk
+        l_amt NUMBER DEFAULT 7700;
+        --Default length of data to decode
+        l_offset NUMBER DEFAULT 1;
+        --Default Offset of data to decode
+        l_tempvarchar VARCHAR2 (32767);
+    BEGIN
+        if p_clob is null then return null; end if;
+        BEGIN
+            DBMS_LOB.createtemporary (l_result, FALSE, DBMS_LOB.CALL);
+            DBMS_LOB.createtemporary (l_chunk, FALSE, DBMS_LOB.CALL);
+            LOOP
+            DBMS_LOB.READ (p_clob, l_amt, l_offset, l_tempvarchar);
+            l_offset := l_amt + l_offset;
+            l_rawin := UTL_RAW.cast_to_raw (l_tempvarchar);
+            l_rawout := UTL_ENCODE.base64_decode (l_rawin);
+            l_chunk := to_clob (utl_raw.cast_to_varchar2(l_rawout));
+            DBMS_LOB.append (l_result, l_chunk);
+            END LOOP;
+        EXCEPTION
+            WHEN NO_DATA_FOUND
+            THEN 
+                 NULL;
+        END;    
+        RETURN l_result;        
+    END;
+
+---------------------------------------------------------------
+---Se le pasa rowid, tabla y columna y convierte de LONG a CLOB
+---------------------------------------------------------------
+function long_to_clob(
+  ent_rowid IN ROWID,ent_tabla IN VARCHAR2,ent_campo in varchar2
+)
+return clob as
+
+/**
+ * Fetches LONG column value and converts it to a CLOB.
+ * @param   dbms_sql_cursor
+ *                  DBMS_SQL cursor parsed, prepared (given column "defined"
+ *                  with DBMS_SQL.DEFINE_COLUMN_LONG) and executed.
+ * @param   col_id  Column ID.
+ * @return  LONG column value as a CLOB.
+ */
+
+  long_val long;
+  long_len integer;
+  buf_len  integer := 32760;
+  cur_pos  number := 0;
+
+  result   clob;
+  lv_cursor    INTEGER := dbms_sql.open_cursor;
+  lv_stmt      VARCHAR2(2000);  -- Dynamic SQL statement
+begin
+  lv_stmt := 'select '||ent_campo||' from '||ent_tabla||' where rowid='''||ent_rowid||'''';
+  dbms_sql.parse(lv_cursor, lv_stmt, dbms_sql.native);
+  dbms_sql.define_column_long(lv_cursor,1);
+  -- Create CLOB.
+  dbms_lob.createtemporary(result, false, dbms_lob.call);
+
+  IF dbms_sql.execute_and_fetch(lv_cursor) = 1 THEN
+      -- Piecewise fetching of the LONG column, appending to the CLOB.
+      loop
+        dbms_sql.column_value_long(
+          lv_cursor,
+          1,
+          buf_len,
+          cur_pos,
+          long_val,
+          long_len
+        );
+        exit when long_len = 0;
+        dbms_lob.append(result, long_val);
+        cur_pos := cur_pos + long_len;
+      end loop;
+  END IF;
+  DBMS_SQL.CLOSE_CURSOR(lv_cursor);
+  return result;
+end long_to_clob;
+
+END UTL_CONVERT;
+/
+
+CREATE OR REPLACE PACKAGE SAK_UTL_REFERENCIAS_PCK AS
+
+  PROCEDURE PROCESAR_TEXTO_REFERENCIAS(ent_tabla in VARCHAR2,ent_tipo in VARCHAR2,ent_site IN VARCHAR2,ent_codigo IN VARCHAR2, ent_lob IN CLOB, forzar IN VARCHAR2 DEFAULT 'N');
+  PROCEDURE PROCESAR_TODO;
+  FUNCTION obtener_site(w_clob in CLOB) RETURN VARCHAR2;
+  FUNCTION ExtraerSite(ent_url in varchar2) RETURN VARCHAR2;
+
+END SAK_UTL_REFERENCIAS_PCK;
+/
+CREATE OR REPLACE PACKAGE BODY SAK_UTL_REFERENCIAS_PCK AS
+
+  FUNCTION obtener_site(w_clob in CLOB) RETURN VARCHAR2 IS
+     site_id VARCHAR2(100);
+     ini NUMBER;
+     fin NUMBER;
+  BEGIN
+      ini := instr(w_clob, 'context="');
+      ini := instr(w_clob, '"', ini, 1);
+      fin := instr(w_clob, '"', ini, 2);
+      site_id := substr(w_clob, ini+1, fin-(ini+1));
+       
+     RETURN site_id;
+  END obtener_site;
+  
+  -----Función que saca el codigo de site de la URL del recurso
+  FUNCTION ExtraerRecurso(ent_url in varchar2) RETURN VARCHAR2 IS
+     w_pos NUMBER;   
+     w_rec VARCHAR2(500);       
+  BEGIN
+     w_pos:=INSTR(ent_url,'/access/content/');
+     IF w_pos<>0 THEN
+        w_rec:=SUBSTR(ent_url,w_pos+length('/access/content'),500);
+     else
+       w_pos:=INSTR(ent_url,'/access/meleteDocs/content/');
+       if w_pos<>0 THEN
+          w_rec:=SUBSTR(ent_url,w_pos+length('/access/meleteDocs/content'),500);
+       end if;
+     END IF;
+     --- Hay que desescapar los caracteres de la URL para que coincida con los de la Base de datos     
+     RETURN UTL_URL.UNESCAPE(w_rec);
+  END ExtraerRecurso;
+  
+  -----Función que saca el codigo de site de la URL del recurso
+  FUNCTION ExtraerSite(ent_url in varchar2) RETURN VARCHAR2 IS
+     w_pos NUMBER;   
+     w_url VARCHAR2(4000);  
+     w_site VARCHAR2(500);
+  BEGIN
+     w_pos:=INSTR(ent_url,'/access/content/');
+     if w_pos<>0 THEN
+       w_url:=SUBSTR(ent_url,w_pos+length('/access/content/'));
+     else
+       w_pos:=INSTR(ent_url,'/access/meleteDocs/content/');
+       if w_pos<>0 THEN
+          w_url:=SUBSTR(ent_url,w_pos+length('/access/meleteDocs/content/'));
+       else
+          w_url:=ent_url;  
+       end if;
+     end if;  
+     --
+     if SUBSTR(w_url,1,length('group/'))='group/' then
+        w_url:=SUBSTR(w_url,length('group/')+1);
+     elsif SUBSTR(w_url,1,length('/group/'))='/group/' then
+        w_url:=SUBSTR(w_url,length('/group/')+1);          
+     elsif SUBSTR(w_url,1,length('group-user/'))='group-user/' then
+        w_url:=SUBSTR(w_url,length('group-user/')+1);
+     elsif SUBSTR(w_url,1,length('/group-user/'))='/group-user/' then
+        w_url:=SUBSTR(w_url,length('/group-user/')+1);          
+     elsif SUBSTR(w_url,1,length('attachment/'))='attachment/' then
+        w_url:=SUBSTR(w_url,length('attachment/')+1);
+     elsif SUBSTR(w_url,1,length('/attachment/'))='/attachment/' then
+        w_url:=SUBSTR(w_url,length('/attachment/')+1);          
+     elsif SUBSTR(w_url,1,length('private/meleteDocs/'))='private/meleteDocs/' then
+        w_url:=SUBSTR(w_url,length('private/meleteDocs/')+1);
+     elsif SUBSTR(w_url,1,length('/private/meleteDocs/'))='/private/meleteDocs/' then
+        w_url:=SUBSTR(w_url,length('/private/meleteDocs/')+1);          
+     elsif SUBSTR(w_url,1,length('private/sferyx/group/'))='private/sferyx/group/' then
+        w_url:=SUBSTR(w_url,length('private/sferyx/group/')+1);
+     elsif SUBSTR(w_url,1,length('/private/sferyx/group/'))='/private/sferyx/group/' then
+        w_url:=SUBSTR(w_url,length('/private/sferyx/group/')+1);
+     elsif SUBSTR(w_url,1,length('private/sferyx/'))='private/sferyx/' then
+        w_url:=SUBSTR(w_url,length('private/sferyx/')+1);
+     elsif SUBSTR(w_url,1,length('/private/sferyx/'))='/private/sferyx/' then
+        w_url:=SUBSTR(w_url,length('/private/sferyx/')+1);
+     elsif SUBSTR(w_url,1,length('user/'))='user/' then
+        w_url:=SUBSTR(w_url,length('user/')+1);
+     elsif SUBSTR(w_url,1,length('/user/'))='/user/' then
+        w_url:=SUBSTR(w_url,length('/user/')+1);          
+     else
+        w_url:='';
+     end if;
+     ---Sacamos el site
+     if w_url is not null then
+        w_pos:=INSTR(w_url,'/');
+        w_site:=SUBSTR(w_url,1,w_pos-1);
+     end if;   
+
+     RETURN w_site;        
+  END ExtraerSite;
+  
+  ----Función que registra las referencias
+  FUNCTION Registra_Referencia(ent_tabla in varchar2, ent_tipo in varchar2, ent_codigo in varchar2, ent_o_site in varchar2,ent_d_site in varchar2,ent_url in varchar2,ent_recurso in varchar2) RETURN NUMBER IS
+      w_conta number;      
+  BEGIN
+    ---Primero comprobamos si el recurso referenciado existe
+    SELECT count(*) INTO w_conta FROM content_resource where resource_id=ent_recurso;
+    ---Ahora insertamos los datos en la tabla  
+    BEGIN
+      INSERT INTO SAK_UTL_REFERENCIAS (tabla,tipo,codigo,site_origen,site_destino,url,recurso,existe,fecha_alta)
+      VALUES (ent_tabla,ent_tipo,ent_codigo,ent_o_site ,ent_d_site,ent_url,ent_recurso,decode(w_conta,0,'N','S'),sysdate);                               
+      RETURN 1;
+    EXCEPTION
+     WHEN DUP_VAL_ON_INDEX THEN
+        UPDATE SAK_UTL_REFERENCIAS
+           SET site_origen=ent_o_site,site_destino=ent_d_site,recurso=ent_recurso,existe=decode(w_conta,0,'N','S')
+         WHERE tabla=ent_tabla AND codigo=ent_codigo AND url=ent_url;
+      RETURN 0;
+    END;       
+  END Registra_Referencia;
+  
+  ---Obtiene un valor de un campo codificado como obase64
+  FUNCTION ObtenerCampoBASE64(w_clob in CLOB,ent_campobase64 in varchar2,is_property IN BOOLEAN DEFAULT FALSE) RETURN CLOB IS
+    w_pos NUMBER;
+    w_posi NUMBER;    
+    w_posf NUMBER;
+    w_abus VARCHAR2(100);
+    w_clob2 CLOB;
+  BEGIN
+    --CASO 1: NO ES una proerty. el dato está asi: nombrecampo="SDFASBASE64DFASDFA"
+    IF NOT is_property THEN
+        w_abus:=ent_campobase64||'="';
+        w_pos:=instr(w_clob,w_abus);
+        --dbms_output.put_line('w_pos:'||w_pos||' entra...:'||substr(w_clob,1,100));
+        IF w_pos=0 THEN
+           RETURN null;
+        ELSE
+           w_posf:= INSTR(SUBSTR(w_clob,w_pos+length(w_abus)),'"');
+           --dbms_output.put_line('w_pof:'||w_posf||'es:'||SUBSTR(w_clob,w_pos+length(w_abus),w_posf-1));
+           w_clob2:=TO_CLOB(SUBSTR(w_clob,w_pos+length(w_abus),w_posf-1));
+           --dbms_output.put_line('pre:'||SUBSTR(w_clob2,1,50));
+        END IF;
+    END IF;
+    --CASO 2: ES una proerty. el dato está asi: name="nombrecampo"  value="SDFASDBASE64FASDFA"
+    IF is_property THEN
+        w_abus:='"'||ent_campobase64||'"';
+        w_pos:=INSTR(w_clob,w_abus);
+        --dbms_output.put_line('w_abus:'||w_abus||' w_pos:'||w_pos);
+        IF w_pos=0 THEN
+           RETURN null;
+        ELSE                  
+           w_pos:=w_pos+LENGTH(w_abus);
+           w_posi:=INSTR(SUBSTR(w_clob,w_pos),'value="')+LENGTH('value="');
+           --dbms_output.put_line('w_posi:'||w_posi);
+           IF w_posi=0 THEN
+              RETURN null;
+           ELSE
+              w_posf:=INSTR(SUBSTR(w_clob,w_pos+w_posi),'"');
+              w_clob2:=TO_CLOB(substr(w_clob,w_pos+w_posi-1,w_posf));
+           END IF;
+        END IF;
+    END IF;
+    --Convertimos a Varchar y devolvemos      
+    RETURN utl_convert.base64_string_to_clob(w_clob2);
+      
+  END ObtenerCampoBASE64;  
+  
+-------------------------------------------
+--- Procesado de la Búsqueda de Referencias ya sea directas o en campos HTML
+-------------------------------------------
+PROCEDURE PROCESAR_REFERENCIAS_DIRECTAS(ent_sql in VARCHAR2, forzar IN VARCHAR2 DEFAULT 'N') IS
+  st_cursor      SYS_REFCURSOR;  
+  w_sql varchar2(2000);
+  w_c_tabla varchar2(100);w_c_tipo varchar2(1);w_c_site varchar2(100); w_c_codigo varchar2(2000);
+  w_posb number; w_posa number; w_posf number;
+  w_ref varchar2(32000); w_d_site VARCHAR2(500);   
+  w_lob CLOB;   w_rec VARCHAR2(500);
+  w_tot number:=0;w_res number; w_contaloop number:=0;
+BEGIN
+  w_sql:=ent_sql;
+  OPEN st_cursor FOR w_sql;
+  loop
+    fetch st_cursor into w_c_tabla,w_c_tipo,w_c_site,w_c_codigo,w_ref;
+    exit when st_cursor%notfound ; 
+         --dbms_output.put_line('Trantando..ITEM:'||w_c_codigo);
+         w_d_site:=ExtraerSite(w_ref);
+         w_rec:=w_ref;  --En la referencia directa lo que entra es el recurso, no la url
+         --Aquí hay que llamar a la función que registra la dependencia r.tabla.r.codigo
+         if (forzar='S' or w_c_site <> w_d_site) then
+           --dbms_output.put_line('Registrando:'||w_c_tabla||'.'||w_c_codigo||': '||w_c_site||' --> '||w_d_site||'   :Rec:'||w_ref);
+           w_res:=Registra_Referencia(w_c_tabla,w_c_tipo,w_c_codigo,w_c_site,w_d_site,w_ref,w_rec);
+           w_tot:=w_tot+w_res;
+           COMMIT;
+         end if;
+  end loop;
+  ----
+  --dbms_output.put_line('Total Referencias Insertadas:'||w_tot);
+  
+END PROCESAR_REFERENCIAS_DIRECTAS;
+
+
+PROCEDURE PROCESAR_TEXTO_REFERENCIAS(ent_tabla in VARCHAR2,ent_tipo in VARCHAR2,ent_site IN VARCHAR2,ent_codigo IN VARCHAR2, ent_lob IN CLOB, forzar IN VARCHAR2 DEFAULT 'N') IS
+
+  w_posb number; w_posa number; w_posa2 number; w_posf number;
+  w_ref varchar2(2000); w_d_site VARCHAR2(500);   
+  w_rec VARCHAR2(500);
+  w_tot number:=0;w_res number; w_contaloop number:=0;
+BEGIN
+  w_posa:=1;
+  w_posb:=instr(ent_lob,'href="');
+  w_contaloop:=0;
+  while w_posb<>0 and w_contaloop<20 loop
+     w_contaloop:=w_contaloop+1;       
+     --dbms_output.put_line('checkeando item:'||ent_codigo||' posición:'||w_posb);
+     w_posa:=w_posa+w_posb-1+6;
+     w_posf:=instr(substr(ent_lob,w_posa),'"');
+     w_ref:=substr(ent_lob,w_posa,least(w_posf-1,2000));
+     --dbms_output.put_line('w_posa:'||w_posa||' w_posf:'||w_posf||'w_ref:'||w_ref);       
+     if w_ref<>'#' then
+       --dbms_output.put_line('ENCONTRADO:'||w_ref);
+       w_d_site:=ExtraerSite(w_ref);
+       w_rec:=ExtraerRecurso(w_ref);
+       --Aquí hay que llamar a la función que registra la dependencia r.tabla.r.codigo
+       if (forzar='S' or ent_site <> w_d_site) then
+         --dbms_output.put_line('Registrando:'||ent_tabla||'.'||ent_codigo||': '||ent_site||' --> '||w_d_site||'   :Rec:'||w_ref);
+         w_res:=Registra_Referencia(ent_tabla,ent_tipo,ent_codigo,ent_site,w_d_site,w_ref,w_rec);
+         w_tot:=w_tot+w_res;
+         COMMIT;
+       end if;
+     end if;
+     w_posa:=w_posa+w_posf;       
+     w_posb:=instr(substr(ent_lob,w_posa),'href="');
+     --dbms_output.put_line('Busando desde:'||w_posa||' encontrado en:'||w_posb);
+  end loop;
+    
+  -- Procesamos las imagenes
+  w_posa:=1;
+  w_posb:=instr(ent_lob,'<img');
+  w_contaloop:=0;
+  while w_posb<>0 and w_contaloop<20 loop
+     w_contaloop:=w_contaloop+1;
+       
+     w_posa:=w_posa+w_posb-1+4; 
+     -- Buscamos el campo src=
+     w_posa2:=instr(substr(ent_lob,w_posa),'src="')+4;
+       
+     --dbms_output.put_line('checkeando item:'||ent_codigo||' posición:'||w_posb);
+     w_posf:=instr(substr(ent_lob,w_posa+w_posa2),'"');
+     w_ref:=substr(ent_lob,w_posa+w_posa2,least(w_posf-1,2000));
+     --dbms_output.put_line('w_posa:'||w_posa||' w_posf:'||w_posf||'w_ref:'||w_ref);       
+       
+     --dbms_output.put_line('ENCONTRADO:'||w_ref);
+     w_d_site:=ExtraerSite(w_ref);
+     w_rec:=ExtraerRecurso(w_ref);
+     --Aquí hay que llamar a la función que registra la dependencia r.tabla.r.codigo
+     if (forzar='S' or ent_site <> w_d_site) then
+       --dbms_output.put_line('Registrando:'||ent_tabla||'.'||ent_codigo||': '||ent_site||' --> '||w_d_site||'   :Rec:'||w_ref);
+       w_res:=Registra_Referencia(ent_tabla,ent_tipo,ent_codigo,ent_site,w_d_site,w_ref,w_rec);
+       w_tot:=w_tot+w_res;
+       COMMIT;
+     end if;
+       
+     w_posa:=w_posa+w_posa2+w_posf;
+     w_posb:=instr(substr(ent_lob,w_posa),'<img ');
+     --dbms_output.put_line('Buscando desde:'||w_posa||' encontrado en:'||w_posb);
+  end loop;
+  ----
+  --dbms_output.put_line('Total Referencias Insertadas:'||w_tot);
+EXCEPTION WHEN OTHERS THEN
+  raise_application_error(-20000,'Error en tabla '||ent_tabla||' site '||ent_site||' codigo '||ent_codigo||' '||sqlerrm);
+END PROCESAR_TEXTO_REFERENCIAS;
+
+PROCEDURE PROCESAR_REFERENCIAS(ent_sql in VARCHAR2,ent_tipocampo IN VARCHAR2 DEFAULT 'CLOB',ent_base64 BOOLEAN DEFAULT FALSE,ent_campobase64 IN VARCHAR2 DEFAULT null,is_property IN BOOLEAN DEFAULT FALSE) IS
+
+  st_cursor      SYS_REFCURSOR;  
+  w_sql varchar2(2000);
+  w_c_tabla varchar2(100);w_c_tipo varchar2(1);w_c_site varchar2(100); w_c_codigo varchar2(2000);
+--  w_posb number; w_posa number; w_posf number;
+--  w_ref varchar2(4000); w_d_site VARCHAR2(500);   
+  w_lob CLOB;   --w_rec VARCHAR2(500);
+--  w_tot number:=0;w_res number; w_contaloop number:=0;
+BEGIN
+  w_sql:=ent_sql;
+  OPEN st_cursor FOR w_sql;
+  loop
+    fetch st_cursor into w_c_tabla,w_c_tipo,w_c_site,w_c_codigo,w_lob;
+    exit when st_cursor%notfound ; 
+    --dbms_output.put_line('Trantando..ITEM:'||w_c_codigo);
+    --El campo de datos es un XML que tiene un campo en base64 con el contenido en html
+    if ent_base64 then 
+       w_lob:= ObtenerCampoBASE64(w_lob,ent_campobase64,is_property);
+       --dbms_output.put_line('body:'||substr(w_lob,1,50)); 
+    end if;
+    PROCESAR_TEXTO_REFERENCIAS(w_c_tabla,w_c_tipo,w_c_site,w_c_codigo,w_lob);
+  end loop;
+END PROCESAR_REFERENCIAS;
+
+PROCEDURE PROCESAR_TODO IS
+  w_sql varchar2(2000);
+  w_maxrows number:=25000;
+  w_siteId varchar2(100);
+BEGIN
+--------------
+--SAMIGO
+--------------
+
+     ---SAM_ITEMTEXT_T.TEXT
+   -- 1.800.000 registros --> 10 minutos
+   w_sql:='select ''SAM_ITEMTEXT_T'' tabla, ''1'' tipo, a.agentid site, it.itemtextid codigo, it.text campo
+            from sam_itemtext_t it, sam_item_t i, sam_section_t s, sam_assessmentbase_t b, sam_authzdata_t a
+           where it.itemid=i.itemid and i.sectionid=s.sectionid and s.assessmentid=b.id and b.id=a.qualifierid and a.functionid=''EDIT_ASSESSMENT''
+           and b.status<>2
+           and not exists (select ''x'' from sam_sectionmetadata_t sm where sm.sectionid=i.sectionid and sm.label=''POOLID_FOR_RANDOM_DRAW'' and sm.entry is not null)';
+            --and rownum<'||w_maxrows; 
+   PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+ 
+   ---SAM_ITEM_T.SAM_ANSWER_T.TEXT
+   w_sql:='select ''SAM_ANSWER_T'' tabla, ''1'' tipo, a.agentid site, aw.answerid codigo, aw.text campo
+            from sam_answer_t aw, sam_item_t i, sam_section_t s, sam_assessmentbase_t b, sam_authzdata_t a
+           where aw.itemid=i.itemid and i.sectionid=s.sectionid and s.assessmentid=b.id and b.id=a.qualifierid and a.functionid=''EDIT_ASSESSMENT''
+           and b.status<>2
+           and not exists (select ''x'' from sam_sectionmetadata_t sm where sm.sectionid=i.sectionid and sm.label=''POOLID_FOR_RANDOM_DRAW'' and sm.entry is not null)';
+            --and rownum<'||w_maxrows; 
+   PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+
+   ---SAM_ITEMFEEDBACK_T.text  => Tarda 3 min al 100%
+   -- 760.000 registros --> 4 minutos
+    w_sql:='select ''SAM_ITEMFEEDBACK_T'' tabla, ''1'' tipo, a.agentid site, ib.itemfeedbackid codigo, ib.text campo
+            from SAM_ITEMFEEDBACK_T ib, sam_item_t i, sam_section_t s, sam_assessmentbase_t b, sam_authzdata_t a
+           where ib.itemid=i.itemid and i.sectionid=s.sectionid and s.assessmentid=b.id and b.id=a.qualifierid and a.functionid=''EDIT_ASSESSMENT''
+           and b.status<>2
+           and not exists (select ''x'' from sam_sectionmetadata_t sm where sm.sectionid=i.sectionid and sm.label=''POOLID_FOR_RANDOM_DRAW'' and sm.entry is not null)';
+            --and rownum<'||w_maxrows; 
+    PROCESAR_REFERENCIAS(w_sql,'VARCHAR2',FALSE,null);
+   
+    ---SAM_PUBLISHEDITEMTEXT_T.text
+    -- 1.500.000 registros --> 8 minutos
+    w_sql:='select ''SAM_PUBLISHEDITEMTEXT_T'' tabla, ''1'' tipo, a.agentid site, it.itemtextid codigo, it.text campo 
+              from SAM_PUBLISHEDITEMTEXT_T it ,sam_publisheditem_t i, sam_publishedsection_t s,SAM_PUBLISHEDASSESSMENT_T b, sam_authzdata_t a
+             where it.itemid=i.itemid and i.sectionid=s.sectionid and s.assessmentid=b.id and b.id=a.qualifierid and a.functionid=''OWN_PUBLISHED_ASSESSMENT''
+             and b.status<>2
+             and not exists (select ''x'' from sam_publishedsectionmetadata_t sm where sm.sectionid=i.sectionid and sm.label=''POOLID_FOR_RANDOM_DRAW'' and sm.entry is not null)';
+              --and rownum<'||w_maxrows;
+    PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+              
+    ---SAM_PUBLISHEDANSWER_T.text
+    w_sql:='select ''SAM_PUBLISHEDANSWER_T'' tabla, ''1'' tipo, a.agentid site, aw.answerid codigo, aw.text campo  
+              from sam_publishedanswer_t aw ,sam_publisheditem_t i, sam_publishedsection_t s,SAM_PUBLISHEDASSESSMENT_T b, sam_authzdata_t a
+             where aw.itemid=i.itemid and i.sectionid=s.sectionid and s.assessmentid=b.id and b.id=a.qualifierid and a.functionid=''OWN_PUBLISHED_ASSESSMENT''
+             and b.status<>2
+             and not exists (select ''x'' from sam_publishedsectionmetadata_t sm where sm.sectionid=i.sectionid and sm.label=''POOLID_FOR_RANDOM_DRAW'' and sm.entry is not null)';
+              --and rownum<'||w_maxrows;
+    PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+
+   ---SAM_PUBLISHEDITEMFEEDBACK_T.text
+   -- 1.000.000 registros --> 4 minutos
+    w_sql:='select ''SAM_PUBLISHEDITEMFEEDBACK_T'' tabla, ''1'' tipo, a.agentid site, ib.itemfeedbackid codigo, ib.text campo
+            from SAM_PUBLISHEDITEMFEEDBACK_T ib, sam_publisheditem_t i, sam_publishedsection_t s,SAM_PUBLISHEDASSESSMENT_T b, sam_authzdata_t a
+             where ib.itemid=i.itemid and i.sectionid=s.sectionid and s.assessmentid=b.id and b.id=a.qualifierid and a.functionid=''OWN_PUBLISHED_ASSESSMENT''
+             and b.status<>2
+             and not exists (select ''x'' from sam_publishedsectionmetadata_t sm where sm.sectionid=i.sectionid and sm.label=''POOLID_FOR_RANDOM_DRAW'' and sm.entry is not null)';
+              --and rownum<'||w_maxrows; 
+    PROCESAR_REFERENCIAS(w_sql,'VARCHAR2',FALSE,null);
+
+    ---SAM_QUESTIONPOOLITEM_T.SAM_ITEMTEXT_T.text
+    -- 210.000 registros --> 3 minutos
+    w_sql:='select ''SAM_QUESTIONPOOLITEM_T'' tabla, ''1'' tipo, qp.ownerid site, it.itemtextid codigo, it.text campo
+            from SAM_QUESTIONPOOL_T qp,SAM_QUESTIONPOOLITEM_T qpi, SAM_ITEMTEXT_T it, sam_item_t i
+           where qp.questionpoolid=qpi.questionpoolid and qpi.itemid=it.itemid and it.itemid=i.itemid';
+             --and rownum<'||w_maxrows;
+    PROCESAR_REFERENCIAS(w_sql,'VARCHAR2',FALSE,null); 
+
+    ---SAM_QUESTIONPOOLITEM_T.SAM_ANSWER_T.text
+    w_sql:='select ''SAM_ANSWER_T'' tabla, ''2'' tipo, qp.ownerid site, aw.answerid codigo, aw.text campo
+            from SAM_QUESTIONPOOL_T qp,SAM_QUESTIONPOOLITEM_T qpi, sam_item_t i, sam_answer_t aw
+           where qp.questionpoolid=qpi.questionpoolid and i.itemid=qpi.itemid and aw.itemid=i.itemid';
+             --and rownum<'||w_maxrows;
+    PROCESAR_REFERENCIAS(w_sql,'VARCHAR2',FALSE,null); 
+
+    -- SAM_ATTATCHMENT (vinculados a exámenes creados)
+    -- 30.000 registros --> <1 minuto
+    w_sql:='select ''SAM_ATTACHMENT_T'' tabla, ''1'' tipo, z.AGENTID site, a.ATTACHMENTID codigo, a.RESOURCEID campo
+            from SAM_ATTACHMENT_T a, SAM_ASSESSMENTBASE_T b, SAM_AUTHZDATA_T z
+            where a.ASSESSMENTID=b.ID and b.id=z.QUALIFIERID and z.FUNCTIONID=''EDIT_ASSESSMENT''
+            and b.status<>2';
+    PROCESAR_REFERENCIAS_DIRECTAS(w_sql);    
+    
+    w_sql:='select ''SAM_ATTACHMENT_T'' tabla, ''2'' tipo, z.AGENTID site, a.ATTACHMENTID codigo, a.RESOURCEID campo
+            from SAM_ATTACHMENT_T a, SAM_ASSESSMENTBASE_T b, SAM_SECTION_T s, SAM_AUTHZDATA_T z
+            where a.SECTIONID=s.SECTIONID and s.ASSESSMENTID = b.ID and b.id=z.QUALIFIERID and z.FUNCTIONID=''EDIT_ASSESSMENT''
+            and b.status<>2';
+    PROCESAR_REFERENCIAS_DIRECTAS(w_sql);
+    
+    w_sql:='select ''SAM_ATTACHMENT_T'' tabla, ''3'' tipo, z.AGENTID site, a.ATTACHMENTID codigo, a.RESOURCEID campo
+            from SAM_ATTACHMENT_T a, SAM_ASSESSMENTBASE_T b, SAM_SECTION_T s, SAM_ITEM_T i, SAM_AUTHZDATA_T z
+            where a.ITEMID=i.itemid and i.SECTIONID = s.SECTIONID and s.ASSESSMENTID = b.ID and b.id=z.QUALIFIERID and z.FUNCTIONID=''EDIT_ASSESSMENT''
+            and b.status<>2';
+    PROCESAR_REFERENCIAS_DIRECTAS(w_sql);
+
+    -- SAM_ATTATCHMENT (vinculados a baterías de preguntas)
+    -- 18.000 registros --> <1 minuto
+    w_sql:='select ''SAM_ATTACHMENT_T'' tabla, ''4'' tipo, i.CREATEDBY site, a.ATTACHMENTID codigo, a.RESOURCEID campo
+            from SAM_ATTACHMENT_T a, SAM_ITEM_T i
+            where a.ITEMID=i.itemid and i.SECTIONID is null';
+    PROCESAR_REFERENCIAS_DIRECTAS(w_sql, 'S');    
+    
+    -- SAM_PUBLISHEDATTACHMENT_T (vinculados a exámenes publicados)
+    -- 25.000 registros --> <1 minuto
+    w_sql:='select ''SAM_PUBLISHEDATTACHMENT_T'' tabla, ''1'' tipo, z.AGENTID site, a.ATTACHMENTID codigo, a.RESOURCEID campo
+            from SAM_PUBLISHEDATTACHMENT_T a, SAM_PUBLISHEDASSESSMENT_T p, SAM_AUTHZDATA_T z
+            where a.ASSESSMENTID=p.ID and p.ID=z.QUALIFIERID and z.FUNCTIONID=''OWN_PUBLISHED_ASSESSMENT''
+            and p.status<>2';
+    PROCESAR_REFERENCIAS_DIRECTAS(w_sql);    
+    
+    w_sql:='select ''SAM_PUBLISHEDATTACHMENT_T'' tabla, ''2'' tipo, z.AGENTID site, a.ATTACHMENTID codigo, a.RESOURCEID campo
+            from SAM_PUBLISHEDATTACHMENT_T a, SAM_PUBLISHEDASSESSMENT_T p, SAM_PUBLISHEDSECTION_T s, SAM_AUTHZDATA_T z
+            where a.SECTIONID=s.SECTIONID and s.ASSESSMENTID = p.ID and p.id=z.QUALIFIERID and z.FUNCTIONID=''OWN_PUBLISHED_ASSESSMENT''
+            and p.status<>2
+            and not exists (select ''x'' from sam_publishedsectionmetadata_t sm where sm.sectionid=s.sectionid and sm.label=''POOLID_FOR_RANDOM_DRAW'' and sm.entry is not null)';
+    PROCESAR_REFERENCIAS_DIRECTAS(w_sql);
+    
+    w_sql:='select ''SAM_PUBLISHEDATTACHMENT_T'' tabla, ''3'' tipo, z.AGENTID site, a.ATTACHMENTID codigo, a.RESOURCEID campo
+            from SAM_PUBLISHEDATTACHMENT_T a, SAM_PUBLISHEDASSESSMENT_T p, SAM_PUBLISHEDSECTION_T s, SAM_PUBLISHEDITEM_T i, SAM_AUTHZDATA_T z
+            where a.ITEMID=i.itemid and i.SECTIONID = s.SECTIONID and s.ASSESSMENTID = p.ID and p.id=z.QUALIFIERID and z.FUNCTIONID=''OWN_PUBLISHED_ASSESSMENT''
+            and p.status<>2
+            and not exists (select ''x'' from sam_publishedsectionmetadata_t sm where sm.sectionid=s.sectionid and sm.label=''POOLID_FOR_RANDOM_DRAW'' and sm.entry is not null)';
+    PROCESAR_REFERENCIAS_DIRECTAS(w_sql);
+
+--------------
+---ANUNCIOS
+--------------
+     -- 160.000 registros --> 6 minutos
+     w_sql:='select ''ANNOUNCEMENT_MESSAGE'' tabla, ''1'' tipo,replace(replace(m.channel_id,''/announcement/channel/'',null),''/main'',null) site,
+                m.message_id codigo,m.xml campo 
+               from ANNOUNCEMENT_MESSAGE m'; 
+               --where rownum<'||w_maxrows;
+               --where message_id=''fb7509b6-05af-4aa4-913f-143947b0be00''';
+               --where LENGTH(xml)>12000 and rownum<5000';
+     PROCESAR_REFERENCIAS(w_sql,'CLOB',TRUE,'body-html');  
+
+--------------
+---ASSIGNMENTS
+--------------
+     w_sql:='select ''ASN_AP_ITEM_T'' tabla, ''1'' tipo,a.context site,ai.id codigo,ai.text campo 
+               from ASN_AP_ITEM_T ai,assignment_assignment a where ai.assignment_id=a.assignment_id';
+     PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);  
+     
+     w_sql:='select ''ASN_MA_ITEM_T'' tabla, ''1'' tipo,a.context site,ai.id codigo,ai.text campo 
+               from ASN_AP_ITEM_T ai,assignment_assignment a where ai.assignment_id=a.assignment_id';
+     PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+     
+     w_sql:='select ''ASN_MA_ITEM_T'' tabla, ''2'' tipo,a.context site,ai.id codigo,ai.note campo 
+               from ASN_NOTE_ITEM_T ai,assignment_assignment a where ai.assignment_id=a.assignment_id';
+     PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+     
+     -- 125.000 registros --> 12 minutos
+     w_sql:='select ''ASSIGNMENT_CONTENT'' tabla, ''1'' tipo, sak_utl_referencias_pck.obtener_site(utl_convert.long_to_clob(rowid,''ASSIGNMENT_CONTENT'',''XML'')) site,content_id codigo,
+                    utl_convert.long_to_clob(rowid,''ASSIGNMENT_CONTENT'',''XML'') campo 
+               from assignment_content a';
+              --where rownum<'||w_maxrows;       
+     PROCESAR_REFERENCIAS(w_sql,'CLOB',TRUE,'instructions-html');
+
+--------------
+---CALENDAR
+--------------  
+     -- 85.000 registros --> 7 minutos
+     w_sql:='select ''CALENDAR_EVENT'' tabla, ''1'' tipo,replace(replace(calendar_id,''/calendar/calendar/'',null),''/main'',null) site,event_id codigo,
+             utl_convert.long_to_clob(rowid,''CALENDAR_EVENT'',''XML'') campo from calendar_event';
+             --where rownum<'||w_maxrows;  
+     PROCESAR_REFERENCIAS(w_sql,'CLOB',TRUE,'CHEF:description-html',TRUE);
+    
+--------------
+---RECURSOS
+--------------
+    -- No hay nada que hacer
+
+-------------------
+--- LESSONBUILDER
+-------------------
+     w_sql:='select ''LESSON_BUILDER_ITEMS'' tabla, ''1'' tipo, p.siteid site, i.id, i.html campo 
+            from LESSON_BUILDER_ITEMS i, lesson_builder_pages p  
+            where i.PAGEID = p.pageid';
+            --and rownum<'||w_maxrows;
+    PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+
+-------------------
+--- Rwiki
+-------------------
+    w_sql:='select ''RWIKICURRENTCONTENT'' tabla, ''1'' tipo, replace(o.realm, ''/site/'',null) site, c.id codigo, c.content campo
+            from rwikicurrentcontent c, rwikiobject o
+            where c.rwikiid=o.id';
+    PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+    
+    w_sql:='select ''RWIKIHISTORYCONTENT'' tabla, ''1'' tipo, replace(o.realm, ''/site/'',null) site, c.id codigo, c.content campo
+            from rwikihistorycontent c, rwikihistory o
+            where c.rwikiid=o.id';
+    PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+
+--------------
+-- SITE
+--------------
+    w_sql:='select ''SAKAI_SITE'' tabla, ''1'' tipo, s.site_id site, s.site_id codigo, s.description campo
+            from sakai_site s';
+    PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+
+------------
+-- SYLLABUS
+------------
+
+    w_sql:='select ''SAKAI_SYLLABUS_DATA'' tabla, ''1'' tipo, i.contextid site, d.id codigo, d.asset campo
+            from sakai_syllabus_data d, sakai_syllabus_item i 
+            where d.surrogatekey = i.id';
+    PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+    
+--------------------
+-- POLLS
+---------------------
+  
+    w_sql:='select ''POLL_POLL'' tabla, ''1'' tipo, POLL_SITE_ID site, POLL_ID codigo, POLL_TEXT campo
+          from poll_poll';
+    PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+    
+    w_sql:='select ''POLL_OPTION'' tabla, ''1'' tipo, p.POLL_SITE_ID site, o.OPTION_ID codigo, o.OPTION_TEXT campo
+            from poll_poll p, poll_option o
+            where p.POLL_ID = o.OPTION_POLL_ID';
+    PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+    
+
+--------------
+---MELETE
+--------------
+
+    -- 95.000 registros --> <1 minuto
+    w_sql:='select ''MELETE_MODULE'' tabla, ''1'' tipo,cm.course_id site, m.module_id codigo,description campo 
+              from melete_module m,melete_course_module cm where m.module_id=cm.module_id';
+              --and rownum<'||w_maxrows;           
+    PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
+
+    -- 275.000 registros --> 
+    w_sql:='select ''MELETE_SECTION_RESOURCE'' tabla, ''1'' tipo,cm.course_id site,sr.RESOURCE_ID codigo,cr.FILE_PATH campo
+              from melete_section_resource sr,melete_section s,melete_course_module cm, CONTENT_RESOURCE cr 
+             where sr.section_id=s.section_id and s.module_id=cm.module_id and sr.RESOURCE_ID=cr.RESOURCE_ID';
+               --and rownum<'||w_maxrows;
+    --El proceso de las referencias de Melete se realiza con MeleteRef.java   
+
+END PROCESAR_TODO;
+END SAK_UTL_REFERENCIAS_PCK;
+/
+
+CREATE OR REPLACE PACKAGE DELETE_SITE_CONTENT AS
+
+  ---Métodos invocbles externamente
+  procedure borrar_site(ent_sak_codigo in varchar2 );
+
+  ---Utilidades
+  FUNCTION conta_info_site(ent_site in VARCHAR2) RETURN VARCHAR2;
+
+END DELETE_SITE_CONTENT;
+/
+CREATE OR REPLACE PACKAGE BODY DELETE_SITE_CONTENT AS
+  cursor c_assign_assign(siteid VARCHAR2) is select * from assignment_assignment where context = siteid;
+  assign_assign assignment_assignment%ROWTYPE;
+
+  ini number;
+  fin number;
+  asi VARCHAR2(255);
+  asi_content VARCHAR2(255);
+  --siteid varchar2(20);
+  
+  procedure logs (p_site VARCHAR2, p_message VARCHAR2)
+  is
+      pragma autonomous_transaction;
+  begin
+      insert into borrar_sites_log (site_id, datetime, message)
+      values (p_site, TO_CHAR(systimestamp, 'yyyy/mm/dd hh24:mi:ss.ff3'), p_message);
+      commit;
+  end logs;
+  
+
+  procedure delete_announcements(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de anuncios');
+    delete from announcement_message where channel_id like '/announcement/channel/'||p_siteid||'/%';
+    delete from announcement_channel where channel_id like '/announcement/channel/'||p_siteid||'/%';
+    logs(p_siteid, 'Fin borrado de anuncios');
+  END delete_announcements;
+
+  procedure delete_assignments(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de tareas');
+    
+    -- Eliminamos el contenido de las tareas
+    open c_assign_assign(p_siteid);
+    loop
+        fetch c_assign_assign into assign_assign;
+        exit when c_assign_assign%NOTFOUND;
+        
+        ini := instr(assign_assign.xml, 'assignmentcontent="');
+        ini := instr(assign_assign.xml, '"', ini, 1);
+        fin := instr(assign_assign.xml, '"', ini, 2);
+        asi := substr(assign_assign.xml, ini+1, fin-(ini+1));
+        ini := instr(asi, '/');
+        asi_content := '';
+        while ini > 0 loop
+          asi_content := substr(asi, ini + 1);
+          ini := instr(asi, '/', ini+1);
+        end loop;
+        logs(p_siteid, 'Content_id = ' || asi_content);
+        DELETE FROM assignment_content WHERE content_id = asi_content;
+          
+    end loop;
+    close c_assign_assign;
+    
+    logs(p_siteid, 'borrado contenidos de tareas');
+    -- Eliminamos los envios de las tareas
+    delete from assignment_submission where context in
+    (
+      select assignment_id from assignment_assignment where context = p_siteid
+    );
+    
+    logs(p_siteid, 'borrado envios de tareas');
+    -- Tabla ASN_AP_ITEM_ACCESS
+    delete from asn_ap_item_access_t where asn_ap_item_id in
+    (
+      select id from asn_ap_item_t where assignment_id in
+      (
+        select assignment_id from assignment_assignment where context = p_siteid
+      )
+    );
+    
+    -- Tabla ASN_AP_ITEM
+    delete from asn_ap_item_t where assignment_id in
+    (
+      select assignment_id from assignment_assignment where context = p_siteid
+    );
+    
+    -- Tabla ASN_NOTE_ITEM
+    delete from asn_note_item_t where assignment_id in
+    (
+      select assignment_id from assignment_assignment where context = p_siteid
+    );
+    
+    -- Tabla ASN_MA_ITEM
+    delete from asn_ma_item_t where assignment_id in
+    (
+      select assignment_id from assignment_assignment where context = p_siteid
+    );
+    
+    -- Tabla ASN_SUP_ATTACH
+    delete from asn_sup_attach_t where ATTACHMENT_ID like concat(concat('%/', p_siteid), '/%');
+    
+    -- Tabla ASN_SUP_ITEM
+    delete from asn_sup_item_t where id in
+    (
+      select id from asn_sup_item_t where id not in
+      (
+        select id from asn_ap_item_t
+        union select id from asn_ma_item_t
+      )
+    );
+    
+    logs(p_siteid, 'borrado tablas asn de tareas');
+    
+    -- Tabla CONTETNREVIEW_ITEM
+    delete from contentreview_item where siteid=p_siteid;
+    
+    -- Eliminamos tareas
+    delete from assignment_assignment where context = p_siteid;
+    
+    logs(p_siteid, 'Fin borrado tareas');
+  END delete_assignments;
+
+  procedure delete_calendars(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de calendarios');
+    delete from calendar_event where calendar_id like concat(concat('%/',p_siteid),'/%');
+    delete from calendar_calendar where calendar_id like concat(concat('%/',p_siteid),'/%');
+    logs(p_siteid, 'Fin borrado de calendarios');
+  END delete_calendars;
+  
+  procedure delete_syllabus(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de syllabus');
+    
+    -- Tabla sakai_syllabus_attach
+    delete from sakai_syllabus_attach where syllabusid in
+    (
+      select id from sakai_syllabus_data where surrogatekey in
+      (
+        select id from sakai_syllabus_item where CONTEXTID = p_siteid
+      )
+    );
+    logs(p_siteid, 'borrado attachments syllabus');
+    
+    -- Tabla sakai_syllabus_data
+    delete from sakai_syllabus_data where surrogatekey in
+    (
+      select id from sakai_syllabus_item where CONTEXTID = p_siteid
+    );
+    logs(p_siteid, 'borrado datos syllabus');
+    
+    -- Tabla sakai_syllabus_item
+    delete from sakai_syllabus_item where CONTEXTID = p_siteid;
+
+    logs(p_siteid, 'Fin borrado de syllabus');
+  END delete_syllabus;
+
+  procedure delete_chats(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de chats');
+    
+    delete from chat2_message where channel_id in (
+      select channel_id from chat2_channel where context = p_siteid
+    );
+    
+    delete from chat2_channel where context = p_siteid;
+    
+    logs(p_siteid, 'Fin borrado de chats');
+  END delete_chats;
+
+  procedure delete_gradebooks(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de calificaciones');
+    
+    -- Tabla GB_COMMENT
+    delete from gb_comment_t where gradable_object_id in 
+    (
+      select id from gb_gradable_object_t where gradebook_id in (select id from gb_gradebook_t where gradebook_uid = p_siteid)
+    );
+    logs(p_siteid, 'borrado de comentarios de calificaciones');
+    
+    -- Tabla GB_GRADING_EVENT
+    delete from gb_grading_event_t where gradable_object_id in 
+    (
+      select id from gb_gradable_object_t where gradebook_id in (select id from gb_gradebook_t where gradebook_uid = p_siteid)
+    );
+    logs(p_siteid, 'borrado de eventos de calificaciones');
+    
+     -- Tabla GB_GRADE_RECORD
+    delete from gb_grade_record_t where gradable_object_id in 
+    (
+      select id from gb_gradable_object_t where gradebook_id in (select id from gb_gradebook_t where gradebook_uid = p_siteid)
+    );
+    logs(p_siteid, 'borrado de registros de calificaciones');
+    
+    -- Tabla GB_GRADABLE_OBJECT
+    delete from gb_gradable_object_t where gradebook_id in (select id from gb_gradebook_t where gradebook_uid = p_siteid);
+    logs(p_siteid, 'borrado de objetos de calificaciones');
+    
+    -- Tabla GB_GRADE_TO_PERCENT_MAPPING  
+    delete from gb_grade_to_percent_mapping_t where grade_map_id in
+    (
+      select id from gb_grade_map_t where gradebook_id in (select id from gb_gradebook_t where gradebook_uid = p_siteid)
+    );
+    
+    -- Tabla GB_GRADE_MAP
+    delete from gb_grade_map_t where gradebook_id in (select id from gb_gradebook_t where gradebook_uid = p_siteid);
+    logs(p_siteid, 'borrado de mapas de calificaciones');
+    
+    -- Tabla GB_SPREADSHEET
+    delete from gb_spreadsheet_t where gradebook_id in (select id from gb_gradebook_t where gradebook_uid = p_siteid);
+    
+    -- Tabla GB_PERMISSION
+    delete from gb_permission_t where gradebook_id in (select id from gb_gradebook_t where gradebook_uid = p_siteid);
+    
+    -- Tabla DB_CATEGORY
+    delete from gb_category_t where gradebook_id in (select id from gb_gradebook_t where gradebook_uid = p_siteid);
+    
+    -- Tabla GB_GRADEBOOK
+    delete from gb_gradebook_t where gradebook_uid = p_siteid;
+    
+    logs(p_siteid, 'Fin borrado de calificaciones');
+  END delete_gradebooks;
+
+  procedure delete_citations(p_siteid VARCHAR2) IS
+  BEGIN
+  
+    /* Obtenemos el file_path del fichero donde se almacena la citation  */
+    /*select r.FILE_PATH from CONTENT_RESOURCE r
+    where r.RESOURCE_TYPE_ID='org.sakaiproject.citation.impl.CitationList'
+    and r.CONTEXT=p_siteid;*/
+
+    /*
+      Habria que leer el contenido del fichero y ese contenido lo relacionamos 
+      con la tabla citation_collection
+    */
+    
+    -- Tabla CITATION_CITATION
+    /*delete from CITATION_CITATION where citation_id in
+    (
+      select cit.citation_id from CITATION_CITATION cit, CITATION_COLLECTION col 
+      where col.PROPERTY_NAME='sakai:hasCitation'
+      and utl_convert.long_to_clob(col.rowid,'CITATION_COLLECTION','PROPERTY_VALUE') like cit.CITATION_ID
+      --and col.COLLECTION_ID in ( valores leidos desde el sistema de archivos )
+    );*/
+    
+    -- Tabla CITATION_CONTENT
+    --delete from CITATION_CONTENT where collection_id in (/* valores leidos desde el sistema de archivos */);
+    
+    -- Tabla CITATION_COLLECTION
+    --delete from CITATION_COLLECTION where collection_id in (/* valores leidos desde el sistema de archivos */);
+    NULL;
+    
+  END delete_citations;
+
+  procedure delete_melete(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de melete');
+    
+    -- Tabla Melete_section_resource 
+    delete from melete_section_resource where section_id in
+    (
+      select section_id from melete_section where module_id in
+      (
+        select module_id from melete_course_module where course_id = p_siteid
+      )
+    );
+    logs(p_siteid, 'borrado de section-recursos de melete');
+    
+    -- Tabla Melete_Resource
+    delete from melete_resource where resource_id like concat(concat('/private/meleteDocs/', p_siteid), '/%'); 
+    logs(p_siteid, 'borrado de recursos de melete');
+    
+    -- Tabla Melete_section
+    delete from melete_section where module_id in
+    (
+      select module_id from melete_course_module where course_id = p_siteid
+    );
+    logs(p_siteid, 'borrado de secciones de melete');
+    
+    -- Tabla Melete_module_shdates
+    delete from melete_module_shdates where module_id in
+    (
+      select module_id from melete_course_module where course_id = p_siteid
+    );
+    logs(p_siteid, 'borrado de modules shdates de melete');
+    
+    -- Tabla Melete_module
+    delete from melete_module where module_id in
+    (
+      select module_id from melete_course_module where course_id = p_siteid
+    );
+    logs(p_siteid, 'borrado de modulos de melete');
+    
+    -- Tabla melete_course_prefs
+    delete from melete_course_prefs where course_id = p_siteid;
+    
+    -- Tabla melete_site_preference
+    delete from melete_site_preference where pref_site_id = p_siteid;
+    
+    -- Tabla melete_course_module
+    delete from melete_course_module where course_id = p_siteid;
+  
+    logs(p_siteid, 'Fin borrado de melete');
+  END delete_melete;
+
+  procedure delete_messages(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de correo interno');
+    
+    -- Tabla mfr_attachment
+    delete from mfr_attachment_t where attachment_id like concat(concat('/attachment/', p_siteid), '/%');
+    logs(p_siteid, 'borrado de attachments de correo interno');
+    
+    -- CORREO INTERNO
+    
+    -- Tabla mfr_message
+    -- en ocasiones esto ha fallado por haber claves ajenas  y he tenido que lanzar esta en su lugar
+--    delete from mfr_pvt_msg_usr_t where messagesurrogatekey in (
+--    select id from mfr_message_t where id in 
+--    (
+--      select messagesurrogatekey from mfr_pvt_msg_usr_t where context_id = p_siteid
+--    ));
+    delete from mfr_message_t where id in 
+    (
+      select messagesurrogatekey from mfr_pvt_msg_usr_t where context_id = p_siteid
+    );
+    logs(p_siteid, 'borrado de mensajes de correo interno');
+    
+    -- Tabla mfr_pvt_msg_ust
+    delete from mfr_pvt_msg_usr_t where context_id = p_siteid;
+  
+    logs(p_siteid, 'Fin borrado de correo interno');
+  END delete_messages;
+
+  procedure delete_forums(siteid VARCHAR2) IS
+  BEGIN
+    logs(siteid, 'Inicio borrado de foros');
+    
+    -- FORUMS
+    
+    -- Tabla mfr_permission_level
+    delete from mfr_permission_level_t where id in
+    (
+      select permission_level from mfr_membership_item_t where a_surrogatekey in 
+      (
+        select id from mfr_area_t where context_id = siteid
+      ) 
+    );
+    delete from mfr_permission_level_t where id in
+    (
+      select permission_level from mfr_membership_item_t where t_surrogatekey in 
+      (
+        select id from mfr_topic_t where of_surrogatekey in 
+        (
+          select id from mfr_open_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid) 
+        ) 
+      ) 
+    );
+    delete from mfr_permission_level_t where id in
+    (
+      select permission_level from mfr_membership_item_t where t_surrogatekey in 
+      (
+        select id from mfr_topic_t where pf_surrogatekey in 
+        (
+          select id from mfr_private_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid)
+        )
+      ) 
+    );
+    delete from mfr_permission_level_t where id in
+    (
+      select permission_level from mfr_membership_item_t where of_surrogatekey in 
+      (
+        select id from mfr_open_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid)
+      )
+    );
+    logs(siteid, 'borrado de permission-level de foros');
+    
+    -- Tabla mfr_membership_item
+    delete from mfr_membership_item_t where a_surrogatekey in 
+    (
+      select id from mfr_area_t where context_id = siteid
+    ); 
+    delete from mfr_membership_item_t where t_surrogatekey in 
+    (
+      select id from mfr_topic_t where of_surrogatekey in 
+      (
+        select id from mfr_open_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid) 
+      ) 
+    ); 
+    delete from mfr_membership_item_t where t_surrogatekey in 
+    (
+      select id from mfr_topic_t where pf_surrogatekey in 
+      (
+        select id from mfr_private_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid)
+      )
+    ); 
+    delete from mfr_membership_item_t where of_surrogatekey in 
+    (
+      select id from mfr_open_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid)
+    );
+    logs(siteid, 'borrado de membership-item de foros');
+    
+    -- Tabla Unread_status
+    delete from mfr_unread_status_t where topic_c in
+    (
+      select id from mfr_topic_t where of_surrogatekey in 
+      (
+        select id from mfr_open_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid)
+      )
+    );
+    logs(siteid, 'borrado de unread-status de foros');
+    
+    -- Tabla mfr_message
+    delete from mfr_message_t where surrogatekey in 
+    (
+      select id from mfr_topic_t where of_surrogatekey in 
+      (
+        select id from mfr_open_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid)
+      )
+    );
+    delete from mfr_message_t where surrogatekey in 
+    (
+      select id from mfr_topic_t where pf_surrogatekey in 
+      (
+        select id from mfr_private_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid)
+      )
+    );
+    logs(siteid, 'borrado de mensajes de foros');
+    
+    -- Tabla mfr_topic
+    delete from mfr_topic_t where pt_surrogatekey in
+    (
+      select id from mfr_topic_t where context_id = siteid
+    );
+    delete from mfr_topic_t where of_surrogatekey in 
+    (
+      select id from mfr_open_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid)
+    );
+    delete from mfr_topic_t where pf_surrogatekey in 
+    (
+      select id from mfr_private_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid)
+    );
+    delete from mfr_topic_t where context_id = siteid;
+    logs(siteid, 'borrado de topics de foros');
+    
+    -- Tabla mfr_private_forum
+    delete from mfr_private_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid);
+    logs(siteid, 'borrado de private-forums de foros');
+    
+    -- Tabla mfr_open_forum
+    delete from mfr_open_forum_t where surrogatekey in (select id from mfr_area_t where context_id = siteid);
+    logs(siteid, 'borrado de open-forums de foros');
+    
+    -- Tabla mfr_hidden_groups_t
+    delete from mfr_hidden_groups_t where a_surrogatekey in (
+    select id from mfr_area_t where context_id = siteid);
+
+    -- Tabla mfr_area
+    delete from mfr_area_t where context_id = siteid;
+    
+    -- Tabla mfr_email_notification
+    delete from mfr_email_notification_t where context_id = siteid;
+    
+    logs(siteid, 'Fin borrado de foros');
+  END delete_forums;
+
+  procedure delete_wiki(siteid VARCHAR2) IS
+  BEGIN
+    logs(siteid, 'Inicio borrado de wiki');
+    
+    -- Tabla rwikipagepresence
+    delete from rwikipagepresence where pagename like concat(concat('/site/', siteid), '/%');
+  
+    -- Tabla rwikipreference
+    delete from rwikipreference where prefcontext like concat(concat('/site/', siteid), '/%');
+    
+    -- Tabla history_content
+    delete from rwikihistorycontent where rwikiid in
+    (
+      select id from rwikihistory where name like concat(concat('/site/', siteid), '/%')
+    );
+    logs(siteid, 'borrado de history-content de wiki');
+    
+    -- Tabla history
+    delete from rwikihistory where name like concat(concat('/site/', siteid), '/%');
+    
+    -- Tabla rwikicontent
+    delete from rwikicurrentcontent where rwikiid in
+    (
+      select id from rwikiobject where name like concat(concat('/site/', siteid), '/%')
+    );
+    logs(siteid, 'borrado de content de wiki');
+    
+    -- Tabla rwikiobject
+    delete from rwikiobject where name like concat(concat('/site/', siteid), '/%');
+  
+    logs(siteid, 'Fin borrado de wiki');
+  END delete_wiki;
+
+  procedure delete_alias(siteid VARCHAR2) IS
+  BEGIN
+    logs(siteid, 'Inicio borrado de alias');
+    
+    delete from sakai_alias_property where alias_id IN
+    (
+      select alias_id from sakai_alias where target like concat(concat('%/', siteid), '/%')
+    );
+    
+    delete from sakai_alias where target like concat(concat('%/', siteid), '/%');
+    
+    logs(siteid, 'Fin borrado de alias');
+  END delete_alias;
+
+  procedure delete_events(siteid VARCHAR2) IS
+  BEGIN
+    logs(siteid, 'Inicio borrado de eventos');
+    
+    -- Tabla sakai_event_delay
+    delete from sakai_event_delay where ref like concat(concat('%/', siteid), '/%');
+    logs(siteid, 'borrado de event-delay de eventos');
+  
+    -- Tabla sakai_sesion
+    delete from sakai_session where session_id in
+     (select SESSION_ID from sakai_event where context = siteid);
+     
+    delete from sakai_session where session_id in
+     (select SESSION_ID from sakai_event where ref = concat(concat('/presence/', siteid), '-presence') and context is null);
+     
+    delete from sakai_session where session_id in
+     (select SESSION_ID from sakai_event where ref like concat(concat('%/', siteid), '/%') and context is null);
+    logs(siteid, 'borrado de sessiones');
+    
+    -- Tabla sakai_sesion_log
+    delete from sakai_session_log where session_id in
+     (select SESSION_ID from sakai_event_log where context = siteid);
+     
+    delete from sakai_session_log where session_id in
+     (select SESSION_ID from sakai_event_log where ref = concat(concat('/presence/', siteid), '-presence') and context is null);
+     
+    delete from sakai_session_log where session_id in
+     (select SESSION_ID from sakai_event_log where ref like concat(concat('%/', siteid), '/%') and context is null);
+    logs(siteid, 'borrado de session-log');
+    
+    -- Tabla sakai_event_log
+    delete from sakai_event_log where context = siteid;
+    delete from sakai_event_log where ref = concat(concat('/presence/', siteid), '-presence') and context is null;
+    delete from sakai_event_log where ref like concat(concat('%/', siteid), '/%') and context is null;
+    logs(siteid, 'borrado de event-logs de eventos');
+    
+    -- Tabla sakai_event
+    delete from sakai_event where context = siteid;
+    delete from sakai_event where ref = concat(concat('/presence/', siteid), '-presence') and context is null;
+    delete from sakai_event where ref like concat(concat('%/', siteid), '/%') and context is null;
+    
+    logs(siteid, 'Fin borrado de eventos');
+  END delete_events;
+
+  procedure delete_sitestats(siteid VARCHAR2) IS
+  BEGIN
+    logs(siteid, 'Inicio borrado de sitestats');
+    
+    delete from sst_events where site_id = siteid;
+    logs(siteid, 'borrado de eventos');
+    
+    delete from sst_preferences where site_id = siteid;
+  
+    delete from sst_reports where site_id = siteid;
+  
+    delete from sst_resources where site_id = siteid;
+    logs(siteid, 'borrado de recursos');
+    
+    delete from sst_siteactivity where site_id = siteid;
+    logs(siteid, 'borrado de siteactivity');
+    
+    delete from sst_sitevisits where site_id = siteid;
+  
+    logs(siteid, 'Fin borrado de sitestats');
+  END delete_sitestats;
+
+  procedure delete_realms(siteid VARCHAR2) IS
+  BEGIN
+    logs(siteid, 'Inicio borrado de realms');
+    
+    -- Tabla function-role
+    delete from sakai_realm_rl_fn where realm_key IN
+        (select realm_key from sakai_realm where realm_id like concat(concat('/site/', siteid), '/%'));
+    delete from sakai_realm_rl_fn where realm_key IN
+        (select realm_key from sakai_realm where realm_id = concat('/site/', siteid));
+    logs(siteid, 'borrado de function-role de realms');
+  
+    -- Tabla user-role
+    delete from sakai_realm_rl_gr where realm_key IN
+        (select realm_key from sakai_realm where realm_id like concat(concat('/site/', siteid), '/%'));
+    delete from sakai_realm_rl_gr where realm_key IN
+        (select realm_key from sakai_realm where realm_id = concat('/site/', siteid));
+    logs(siteid, 'borrado de user-role de realms');
+    
+    -- Tabla role_descripcion
+    delete from sakai_realm_role_desc where realm_key IN
+        (select realm_key from sakai_realm where realm_id like concat(concat('/site/', siteid), '/%'));
+    delete from sakai_realm_role_desc where realm_key IN
+        (select realm_key from sakai_realm where realm_id = concat('/site/', siteid));
+    logs(siteid, 'borrado de role-description de realms');
+    
+    -- Tabla provider
+    delete from sakai_realm_provider where realm_key IN
+        (select realm_key from sakai_realm where realm_id like concat(concat('/site/', siteid), '/%'));
+    delete from sakai_realm_provider where realm_key IN
+        (select realm_key from sakai_realm where realm_id = concat('/site/', siteid));
+    logs(siteid, 'borrado de realm-provider de realms');
+    
+    -- Tabla realm
+    delete from sakai_realm where realm_id like concat(concat('/site/', siteid), '/%');
+    delete from sakai_realm where realm_id = concat('/site/', siteid);
+    
+    logs(siteid, 'Fin borrado de realms');
+  END delete_realms;
+
+  procedure delete_assessments(p_siteid VARCHAR2) IS
+  BEGIN
+
+    ---------------------
+    ------- Examenes publicados
+    ---------------------
+
+    logs(p_siteid, 'Inicio borrado de examenes');
+    
+    -- Tabla feedback de respuestas de examenes publicados
+    delete from sam_publishedanswerfeedback_t where answerid in
+    (
+      select answerid from sam_publishedanswer_t where itemid in
+      (
+        select itemid from sam_publisheditem_t where sectionid in
+        (
+          select sectionid from sam_publishedsection_t where assessmentid IN
+          (
+            select id from sam_publishedassessment_t where id in 
+            (
+              select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+            )
+          )
+        )
+      )
+    );
+    logs(p_siteid, 'borrado de feedback de respuestas de examenes publicados');
+    
+    -- Tabla respuestas de examenes publicados
+    delete from sam_publishedanswer_t where itemid in
+    (
+      select itemid from sam_publisheditem_t where sectionid in
+      (
+        select sectionid from sam_publishedsection_t where assessmentid IN
+        (
+          select id from sam_publishedassessment_t where id in 
+          (
+            select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+          )
+        )
+      )
+    );
+    logs(p_siteid, 'borrado de respuestas de examenes publicados');
+    
+    -- Tabla texto de items de examenes publicados
+    delete from sam_publisheditemtext_t where itemid in
+    (
+      select itemid from sam_publisheditem_t where sectionid in
+      (
+        select sectionid from sam_publishedsection_t where assessmentid IN
+        (
+          select id from sam_publishedassessment_t where id in 
+          (
+            select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+          )
+        )
+      )
+    );
+    logs(p_siteid, 'borrado de texto de items de examenes publicados');
+
+    -- Tabla feedback de items de examenes publicados
+    delete from sam_publisheditemfeedback_t where itemid in
+    (
+      select itemid from sam_publisheditem_t where sectionid in
+      (
+        select sectionid from sam_publishedsection_t where assessmentid IN
+        (
+          select id from sam_publishedassessment_t where id in 
+          (
+            select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+          )
+        )
+      )
+    );
+    logs(p_siteid, 'borrado de feedback de items de examenes publicados');
+  
+    -- Tabla metadata de items de examenes publicados
+    delete from sam_publisheditemmetadata_t where itemid in
+    (
+      select itemid from sam_publisheditem_t where sectionid in
+      (
+        select sectionid from sam_publishedsection_t where assessmentid IN
+        (
+          select id from sam_publishedassessment_t where id in 
+          (
+            select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+          )
+        )
+      )
+    );
+    logs(p_siteid, 'borrado de metadata de items de examenes publicados');
+    
+    -- Tabla adjuntos en examenes publicados
+    delete from sam_publishedattachment_t where itemid in
+    (
+      select itemid from sam_publisheditem_t where sectionid in
+      (
+        select sectionid from sam_publishedsection_t where assessmentid IN
+        (
+          select id from sam_publishedassessment_t where id in 
+          (
+            select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+          )
+        )
+      )
+    );
+    
+    delete from sam_publishedattachment_t where sectionid in
+    (
+      select sectionid from sam_publishedsection_t where assessmentid IN
+      (
+        select id from sam_publishedassessment_t where id in 
+        (
+          select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+        )
+      )
+    );
+    
+    delete from sam_publishedattachment_t where assessmentid IN
+    (
+      select id from sam_publishedassessment_t where id in 
+      (
+        select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de adjuntos de examenes publicados');
+
+    -- Tabla items de examenes publicados
+    delete from sam_publisheditem_t where sectionid in
+    (
+      select sectionid from sam_publishedsection_t where assessmentid IN
+      (
+        select id from sam_publishedassessment_t where id in 
+        (
+          select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+        )
+      )
+    );
+    logs(p_siteid, 'borrado de items de examenes publicados');
+    
+    -- Tenemos en cuenta los media borrados del FS
+    insert into BORRAR_SITES_RESOURCES_FS(site_id,resource_id,file_path,tipo)
+      select p_siteid, filename, concat('rm ', substr(replace(location, 'var/sakai/', 'varsakai/'), 2)), 'M' from sam_media_t where itemgradingid in 
+      (
+        select itemgradingid from sam_itemgrading_t where assessmentgradingid in
+        (
+          select assessmentgradingid from sam_assessmentgrading_t where publishedassessmentid IN
+          (
+            select id from sam_publishedassessment_t where id in 
+            (
+              select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+            )      
+          )
+        )
+      );
+    logs(p_siteid, 'insertados los elementos media a borrar del FS');
+    
+    -- Tabla media
+    delete from sam_media_t where itemgradingid in 
+    (
+      select itemgradingid from sam_itemgrading_t where assessmentgradingid in
+      (
+        select assessmentgradingid from sam_assessmentgrading_t where publishedassessmentid IN
+        (
+          select id from sam_publishedassessment_t where id in 
+          (
+            select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+          )      
+        )
+      )
+    );
+    logs(p_siteid, 'borrado de media');
+    
+    -- Tabla itemgradings de examenes publicados
+    delete from sam_itemgrading_t where assessmentgradingid in
+    (
+      select assessmentgradingid from sam_assessmentgrading_t where publishedassessmentid IN
+      (
+        select id from sam_publishedassessment_t where id in 
+        (
+          select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+        )      
+      )
+    );  
+    logs(p_siteid, 'borrado de itemgradings de examenes publicados');
+    
+    -- Tabla metadatos en secciones de examenes publicados
+    delete from sam_publishedsectionmetadata_t where sectionid in
+    (
+      select sectionid from sam_publishedsection_t where assessmentid IN
+      (
+        select id from sam_publishedassessment_t where id in 
+        (
+          select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+        )
+      )
+    );
+    logs(p_siteid, 'borrado de metadatos de secciones de examenes publicados');
+    
+    -- Tabla secciones de examenes publicados
+    delete from sam_publishedsection_t where assessmentid IN
+    (
+      select id from sam_publishedassessment_t where id in 
+      (
+        select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de secciones de examenes publicados');
+  
+    -- Tabla de sumario de examenes publicados 
+    delete from sam_studentgradingsummary_t where publishedassessmentid in
+    (
+      select id from sam_publishedassessment_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de sumario de examenes publicados');
+    
+    -- Tabla dir IPs de examenes publicados
+    delete from sam_publishedsecuredip_t where assessmentid IN
+    (
+      select id from sam_publishedassessment_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de dirIps de examenes publicados');
+  
+    -- Tabla metadatos de examenes publicados
+    delete from sam_publishedmetadata_t where assessmentid IN
+    (
+      select id from sam_publishedassessment_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de metadatos de examenes publicados');
+  
+    -- Tabla comentarios de examenes publicados
+    delete from sam_publishedfeedback_t where assessmentid IN
+    (
+      select id from sam_publishedassessment_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de comentarios de examenes publicados');
+    
+    -- Tabla evaluacion de examenes publicados
+    delete from sam_publishedevaluation_t where assessmentid IN
+    (
+      select id from sam_publishedassessment_t where id in 
+      (
+        select qualifierid from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de evaluacion de examenes publicados');
+  
+    -- Tabla control de examenes publicados
+    delete from sam_publishedaccesscontrol_t where assessmentid IN
+    (
+      select id from sam_publishedassessment_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de control de examenes publicados');
+    
+    -- Tabla assessmentgrading de examenes publicados
+    delete from sam_assessmentgrading_t where publishedassessmentid IN
+    (
+      select id from sam_publishedassessment_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+      )      
+    );
+    logs(p_siteid, 'borrado de assessmentgrading de examenes publicados');
+  
+    --Tabla examenes publicados
+    delete from sam_publishedassessment_t where id IN
+    (
+      select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid like '%PUBLISHED%'
+    );
+    logs(p_siteid, 'borrado de examenes publicados');
+
+    --Tabla eventos examenes publicados
+    delete from sam_eventlog_t where siteid = p_siteid;
+    logs(p_siteid, 'borrado de eventos de examenes publicados');
+
+    ---------------------
+    ------- Examenes creados
+    ---------------------
+    
+    -- Tabla Answer_feedback
+    delete from sam_answerfeedback_t where answerid in
+    (
+      select answerid from sam_answer_t where itemid in
+      (
+        select itemid from sam_item_t itm where sectionid in 
+        (
+          select sectionid from sam_section_t where assessmentid in 
+          ( 
+            select id from sam_assessmentbase_t where id in 
+            (
+              select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+            )
+          )
+        )
+        and not exists (select 'x' from sam_questionpoolitem_t qi where qi.itemid=itm.itemid)
+      )
+    );
+    logs(p_siteid, 'borrado de feedback de respuestas de examenes');
+  
+    -- Tabla Answer
+    delete from sam_answer_t where itemid in
+    (
+      select itemid from sam_item_t itm where sectionid in 
+      (
+        select sectionid from sam_section_t where assessmentid in 
+        ( 
+          select id from sam_assessmentbase_t where id in 
+          (
+            select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+          )
+        )
+      )
+      and not exists (select 'x' from sam_questionpoolitem_t qi where qi.itemid=itm.itemid)
+    );
+    logs(p_siteid, 'borrado de respuestas de examenes');
+    
+    -- Tabla Item_text
+    delete from sam_itemtext_t where itemid in
+    (
+      select itemid from sam_item_t itm where sectionid in 
+      (
+        select sectionid from sam_section_t where assessmentid in 
+        ( 
+          select id from sam_assessmentbase_t where id in 
+          (
+            select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+          )
+        )
+      )
+      and not exists (select 'x' from sam_questionpoolitem_t qi where qi.itemid=itm.itemid)
+    );
+    logs(p_siteid, 'borrado de texto de items de examenes');
+    
+    -- Tabla Item_metadata
+    delete from sam_itemmetadata_t where itemid in
+    (
+      select itemid from sam_item_t itm where sectionid in 
+      (
+        select sectionid from sam_section_t where assessmentid in 
+        ( 
+          select id from sam_assessmentbase_t where id in 
+          (
+            select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+          )
+        )
+      )
+      and not exists (select 'x' from sam_questionpoolitem_t qi where qi.itemid=itm.itemid)
+    );
+    logs(p_siteid, 'borrado de metadata de items de examenes');
+    
+    -- Item feedback
+    delete from sam_itemfeedback_t where itemid in
+    (
+      select itemid from sam_item_t itm where sectionid in 
+      (
+        select sectionid from sam_section_t where assessmentid in 
+        ( 
+          select id from sam_assessmentbase_t where id in 
+          (
+            select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+          )
+        )
+      )
+      and not exists (select 'x' from sam_questionpoolitem_t qi where qi.itemid=itm.itemid)
+    );
+    logs(p_siteid, 'borrado de feedback de items de examenes');
+    
+    -- Tabla sam_attachments
+    delete from sam_attachment_t where itemid in 
+    (
+      select itemid from sam_item_t itm where sectionid in 
+      (
+        select sectionid from sam_section_t where assessmentid in 
+        ( 
+          select id from sam_assessmentbase_t where id in 
+          (
+            select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+          )
+        )
+      )
+      and not exists (select 'x' from sam_questionpoolitem_t qi where qi.itemid=itm.itemid)
+    );
+    
+    delete from sam_attachment_t where sectionid in 
+    (
+      select sectionid from sam_section_t where assessmentid in 
+      ( 
+        select id from sam_assessmentbase_t where id in 
+        (
+          select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+        )
+      )
+    );
+    
+    delete from sam_attachment_t where assessmentid in 
+    ( 
+      select id from sam_assessmentbase_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de adjuntos de examenes');
+    
+    -- Tabla Items
+    update sam_item_t itm
+      set itm.sectionid=null
+    where itm.sectionid in
+    (
+      select s.sectionid from sam_section_t s where assessmentid in
+      (
+        select id from sam_assessmentbase_t where id in
+        (
+          select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+        )
+      )
+    ) and exists (select 'x' from sam_questionpoolitem_t qi where qi.itemid=itm.itemid);
+    logs(p_siteid, 'actualizando items compartidos con baterias ... sectionid a null');
+    
+    delete from sam_item_t itm where sectionid in 
+    (
+      select sectionid from sam_section_t where assessmentid in 
+      ( 
+        select id from sam_assessmentbase_t where id in 
+        (
+          select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+        )
+      )
+    ) and not exists (select 'x' from sam_questionpoolitem_t qi where qi.itemid=itm.itemid);
+    logs(p_siteid, 'borrado de items de examenes');
+    
+    -- Tabla Secciones_metadata
+    delete from sam_sectionmetadata_t where sectionid IN
+    (
+      select sectionid from sam_section_t where assessmentid in 
+      ( 
+        select id from sam_assessmentbase_t where id in 
+        (
+          select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+        )
+      )
+    );
+    logs(p_siteid, 'borrado de metadata de secciones de examenes');
+    
+    -- Tabla Secciones
+    delete from sam_section_t where assessmentid in 
+    ( 
+      select id from sam_assessmentbase_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de secciones de examenes');
+  
+    -- Tabla Dir. IP examenes
+    delete from sam_securedip_t where assessmentid IN
+    (
+      select id from sam_assessmentbase_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de dirIp de examenes');
+    
+    -- Tabla Assessment_metadata
+    delete from sam_assessmetadata_t where assessmentid IN
+    (
+      select id from sam_assessmentbase_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de feedback de examenes');
+    
+    -- Tabla Assessment_control
+    delete from sam_assessaccesscontrol_t where assessmentid IN
+    (
+      select id from sam_assessmentbase_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de control de examenes');
+    
+    -- Tabla Assessment_evaluacion
+    delete from sam_assessevaluation_t where assessmentid IN
+    (
+      select id from sam_assessmentbase_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de evaluacion de examenes');
+  
+    -- Tabla Assessment_feedback
+    delete from sam_assessfeedback_t where assessmentid IN
+    (
+      select id from sam_assessmentbase_t where id in 
+      (
+        select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+      )
+    );
+    logs(p_siteid, 'borrado de feedback de examenes');
+  
+    -- Tabla Examenes
+    delete from sam_assessmentbase_t where id in 
+    (
+      select DISTINCT(qualifierid) from sam_authzdata_t where agentid = p_siteid and functionid not like '%PUBLISHED%'
+    );
+    logs(p_siteid, 'borrado de examenes');
+    
+    -- Tabla Authzdata
+    delete from sam_authzdata_t where agentid in 
+    ( 
+      select group_id from sakai_site_group where site_id = p_siteid 
+    );
+
+    delete from sam_authzdata_t where agentid = p_siteid;
+        
+    logs(p_siteid, 'Fin borrado de examenes');
+    commit;
+  END delete_assessments;
+  
+  procedure delete_site_data(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de sites');
+    
+    --Tabla propiedades de herramienta
+    delete from sakai_site_tool_property where site_id = p_siteid;
+    
+    --Tabla de herramientas
+    delete from sakai_site_tool where site_id = p_siteid;
+    
+    -- Tabla de propiedades del site
+    delete from sakai_site_property where site_id = p_siteid;
+    
+    -- Tabla de propiedades de paginas
+    delete from sakai_site_page_property where site_id = p_siteid;
+    
+    -- Tabla de paginas
+    delete from sakai_site_page where site_id = p_siteid;
+    
+    -- Tabla de propieades de grupos
+    delete from sakai_site_group_property where site_id = p_siteid;
+    
+    -- Tabla de grupos
+    delete from sakai_site_group where site_id = p_siteid;
+    
+    -- Tabla de usuarios de site
+    delete from sakai_site_user where site_id = p_siteid;
+    
+    -- Tabla de sites
+    delete from sakai_site where site_id = p_siteid;
+  
+    logs(p_siteid, 'Fin borrado de sites');
+  END delete_site_data;
+  
+  procedure delete_resources(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de recursos');
+    insert into BORRAR_SITES_RESOURCES_FS(site_id,resource_id,file_path,tipo)
+        select p_siteid, resource_id, concat('rm sakai/', substr(file_path, 2)), 'C'
+          from content_resource 
+            where resource_id like '/group/'||p_siteid||'/%'        or resource_id like '/group-user/'||p_siteid||'/%'
+               or resource_id like '/attachment/'||p_siteid||'/%'   or resource_id like '/private/meleteDocs/'||p_siteid||'/%'
+               or resource_id like '/private/sferyx/group/'||p_siteid||'/%' or resource_id like '/private/sferyx/private/meleteDocs/'||p_siteid||'/%';
+    logs(p_siteid, 'insertados recursos en tabla BORRAR_SITE_RESOURCES_FS');
+    
+    delete from content_type_registry where context_id = p_siteid;
+    logs(p_siteid, 'borrado de type-registry');
+    
+    delete from content_dropbox_changes where in_collection like concat(concat('/group-user/', p_siteid), '/');
+    logs(p_siteid, 'borrado de dropbox changes');
+    
+    delete from content_resource_delete 
+                where resource_id like '/group/'||p_siteid||'/%'        or resource_id like '/group-user/'||p_siteid||'/%'
+               or resource_id like '/attachment/'||p_siteid||'/%'   or resource_id like '/private/meleteDocs/'||p_siteid||'/%'
+               or resource_id like '/private/sferyx/group/'||p_siteid||'/%' or resource_id like '/private/sferyx/private/meleteDocs/'||p_siteid||'/%';
+    logs(p_siteid, 'borrado de resource-delete');
+    
+    delete from content_resource 
+            where resource_id like '/group/'||p_siteid||'/%'        or resource_id like '/group-user/'||p_siteid||'/%'
+               or resource_id like '/attachment/'||p_siteid||'/%'   or resource_id like '/private/meleteDocs/'||p_siteid||'/%'
+               or resource_id like '/private/sferyx/group/'||p_siteid||'/%' or resource_id like '/private/sferyx/private/meleteDocs/'||p_siteid||'/%';
+    logs(p_siteid, 'borrado de recursos');
+    
+    delete from content_collection 
+                where collection_id like '/group/'||p_siteid||'/%'        or collection_id like '/group-user/'||p_siteid||'/%'
+                   or collection_id like '/attachment/'||p_siteid||'/%'   or collection_id like '/private/meleteDocs/'||p_siteid||'/%'
+                   or collection_id like '/private/sferyx/group/'||p_siteid||'/%' or collection_id like '/private/sferyx/private/meleteDocs/'||p_siteid||'/%';
+    logs(p_siteid, 'borrado de colecciones');
+                
+    logs(p_siteid, 'Fin borrado de recursos');
+  END delete_resources;
+  
+  procedure delete_polls(siteid VARCHAR2) IS
+  BEGIN
+    logs(siteid, 'Inicio borrado de polls');
+    
+    delete from poll_option where option_poll_id in
+    (
+      select poll_id from poll_poll where poll_site_id = siteid
+    );
+    logs(siteid, 'borrado de option polls');
+    
+    delete from poll_vote where vote_poll_id in
+    (
+      select poll_id from poll_poll where poll_site_id = siteid
+    );
+    logs(siteid, 'borrado de vote polls');
+    
+    delete from poll_poll where poll_site_id = siteid;
+    
+    logs(siteid, 'Fin borrado de polls');
+  END delete_polls;
+  
+  procedure delete_signup(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de la herramienta SIGNUP');
+    
+    -- Signup_Attachments
+    DELETE SIGNUP_ATTACHMENTS where MEETING_ID in
+    (select MEETING_ID from SIGNUP_SITES where SITE_ID=p_siteid);
+    
+    -- Signup_ts
+    DELETE signup_ts where MEETING_ID in
+    (select MEETING_ID from SIGNUP_SITES where SITE_ID=p_siteid);
+    
+    -- Signup_ts_attendees
+    DELETE SIGNUP_TS_ATTENDEES where SIGNUP_SITE_ID in
+    (select ID from SIGNUP_SITES where SITE_ID=p_siteid);
+    
+    -- Signup_ts_waitinglist
+    DELETE SIGNUP_TS_WAITINGLIST where SIGNUP_SITE_ID in
+    (select ID from SIGNUP_SITES where SITE_ID=p_siteid);
+    
+    -- Signup_site_groups
+    DELETE SIGNUP_SITE_GROUPS where SIGNUP_SITE_ID in
+    (select ID from SIGNUP_SITES where SITE_ID=p_siteid);
+    
+    -- Signup_meetings
+    DELETE SIGNUP_MEETINGS where id in
+    (select ID from SIGNUP_SITES where SITE_ID=p_siteid);
+    
+    -- Signup_site
+    DELETE SIGNUP_SITES where SITE_ID=p_siteid;
+    
+    logs(p_siteid, 'Fin borrado de la herramienta SIGNUP');
+  END delete_signup;
+  
+  procedure delete_lessonbuilder(p_siteid VARCHAR2) IS
+  BEGIN
+    logs(p_siteid, 'Inicio borrado de la herramienta LESSONBUILDER');
+    
+    -- LESSON_BUILDER_LOG
+    DELETE LESSON_BUILDER_LOG where ITEMID in 
+    (select itemid from LESSON_BUILDER_ITEMS where PAGEID in 
+      (select pageid from lesson_builder_pages where SITEID=p_siteid));
+      
+    DELETE LESSON_BUILDER_LOG where STUDENTPAGEID in
+    (select PAGEID from LESSON_BUILDER_STUDENT_PAGES where ITEMID in 
+    (select itemid from LESSON_BUILDER_ITEMS where PAGEID in 
+      (select pageid from lesson_builder_pages where SITEID=p_siteid)));
+    
+    -- LESSON_BUILDER_STUDENT_PAGES
+    DELETE LESSON_BUILDER_STUDENT_PAGES where ITEMID in 
+    (select itemid from LESSON_BUILDER_ITEMS where PAGEID in 
+      (select pageid from lesson_builder_pages where SITEID=p_siteid));
+    
+    -- LESSON_BUILDER_GROUPS
+    DELETE LESSON_BUILDER_GROUPS where ITEMID in 
+    (select itemid from LESSON_BUILDER_ITEMS where PAGEID in 
+      (select pageid from lesson_builder_pages where SITEID=p_siteid));
+    
+    -- LESSON_BUILDER_ITEMS
+    DELETE LESSON_BUILDER_ITEMS where PAGEID in 
+    (select pageid from lesson_builder_pages where SITEID=p_siteid);
+    
+    -- LESSON_BUILDER_COMMENTS
+    DELETE LESSON_BUILDER_COMMENTS where PAGEID in 
+    (select pageid from lesson_builder_pages where SITEID=p_siteid);
+    
+    -- LESSON_BUILDER_PAGES
+    DELETE lesson_builder_pages where SITEID=p_siteid;
+    
+    logs(p_siteid, 'Fin borrado de la herramienta LESSONBUILDER');
+  END delete_lessonbuilder;
+  
+  
+  
+  
+  FUNCTION conta_info_site(ent_site in VARCHAR2) RETURN VARCHAR2 IS
+     w_info VARCHAR2(1000);
+     w_conta NUMBER;
+     w_totr NUMBER:=0;
+  BEGIN
+      --Alias
+      select count(*) into w_conta from sakai_alias where target like concat(concat('%/', ent_site), '/%');
+      if w_conta>0 then
+         w_info:=w_info||'Alias:'||w_conta||chr(10);
+      end if;  
+      --Anuncios
+      select count(*) into w_conta from announcement_message where channel_id like '/announcement/channel/'||ent_site||'/%';
+      if w_conta>0 then
+         w_info:=w_info||'Announcements:'||w_conta||chr(10);
+      end if;  
+     --Contamos examenes publicados
+      select count(*) into w_conta from sam_publishedassessment_t where id in 
+      (
+        select qualifierid from sam_authzdata_t where agentid = ent_site and functionid like '%PUBLISHED%'
+      );
+      if w_conta>0 then
+         w_info:=w_info||'Publishedassessment:'||w_conta||chr(10);
+      end if;
+     --
+     --Contamos los Recursos
+      select count(*) into w_conta from content_resource where resource_id like '/group/'||ent_site||'/%';
+      if w_conta>0 then
+         w_totr:=w_totr+w_conta;
+         w_info:=w_info||'Resources:'||w_conta||chr(10);
+      end if;
+     --Contamos los Dropbox
+      select count(*) into w_conta from content_resource where resource_id like '/group-user/'||ent_site||'/%';
+      if w_conta>0 then
+         w_totr:=w_totr+w_conta;
+         w_info:=w_info||'Dropbox:'||w_conta||chr(10);
+      end if;
+     --Contamos los anexos
+      select count(*) into w_conta from content_resource where resource_id like '/attachment/'||ent_site||'/%';
+      if w_conta>0 then
+         w_totr:=w_totr+w_conta;
+         w_info:=w_info||'Attachments:'||w_conta||chr(10);
+      end if;
+     --Contamos recurssos de Melete
+      select count(*) into w_conta from content_resource where resource_id like '/private/meleteDocs/'||ent_site||'/%';
+      if w_conta>0 then
+         w_totr:=w_totr+w_conta;
+         w_info:=w_info||'RecusosMelete:'||w_conta||chr(10);
+      end if;      
+     --Contamos recurssos de sferyx
+      select count(*) into w_conta from content_resource 
+      where resource_id like '/private/sferyx/group/'||ent_site||'/%' or resource_id like '/private/sferyx/private/meleteDocs/'||ent_site||'/%';
+      if w_conta>0 then
+         w_totr:=w_totr+w_conta;
+         w_info:=w_info||'RecusosSferyx:'||w_conta||chr(10);
+      end if;         
+     --Total Recursos
+     if w_totr>0 then
+       w_info:=w_info||'TOTALRECURSOS:'||w_totr||chr(10);
+     end if;   
+     --Contamos poll tool
+      select count(*) into w_conta from poll_poll where poll_site_id = ent_site;
+      if w_conta>0 then
+         w_info:=w_info||'Poll:'||w_conta||chr(10);
+      end if;         
+    -- 
+     -- Devolvemos los resultados
+     RETURN w_info;
+  END;
+  
+   procedure borrar_site(ent_sak_codigo in varchar2 ) IS
+    num_ref number;
+    v_siteid varchar2(20);
+  BEGIN
+    v_siteid := ent_sak_codigo;
+    
+    -- En caso de que el site a borrar este referenciado desde otro site NO hacemos nada
+    select count(*) into num_ref
+    from sak_utl_referencias where site_destino=v_siteid
+    and (exists (select 'x' from sakai_site where site_id=site_origen) or
+         exists (select 'x' from sakai_site where site_id='~'||site_origen));
+    if num_ref > 0 then
+      logs(v_siteid, 'No se puede borrar el site. Tiene referencias en otro site.');
+      return;
+    end if;
+    
+    ------------------------
+    -- Borramos los anuncios
+    ------------------------
+    delete_announcements(v_siteid);
+    
+    -----------------------
+    -- Borramos las Tareas
+    -----------------------
+    delete_assignments(v_siteid);
+    
+    ---------------------
+    -- calendarios
+    ---------------------
+    delete_calendars(v_siteid);
+    
+    ---------------------
+    -- syllabus
+    ---------------------
+    delete_syllabus(v_siteid);
+    
+    ----------------------- 
+    -- chat 
+    -----------------------
+    --drop table chat_message cascade constraints;
+    --drop table chat_channel cascade constraints;
+    
+    delete_chats(v_siteid);
+    
+    ---------------------------
+    -- Citations
+    -----------------------------
+    --delete_citations(siteid);
+    
+    -------------------------------------------------
+    -- Eliminamos Gradebook relacionados con el site
+    --------------------------------------------------
+    dbms_utility.exec_ddl_statement('alter table SAKAI.GB_GRADEBOOK_T disable constraint FK7C870191F11270F8');
+    dbms_utility.exec_ddl_statement('alter table SAKAI.GB_GRADE_MAP_T disable constraint FKADE112256AB1529A');
+    delete_gradebooks(v_siteid);
+    dbms_utility.exec_ddl_statement('alter table SAKAI.GB_GRADEBOOK_T enable constraint FK7C870191F11270F8');
+    dbms_utility.exec_ddl_statement('alter table SAKAI.GB_GRADE_MAP_T enable constraint FKADE112256AB1529A');
+    
+    -------------------------------------------------
+    -- Eliminamos Melete
+    --------------------------------------------------
+    dbms_utility.exec_ddl_statement('alter table SAKAI.MELETE_COURSE_MODULE disable constraint FK5FE498D34995ABCE');
+    delete_melete(v_siteid);
+    dbms_utility.exec_ddl_statement('alter table SAKAI.MELETE_COURSE_MODULE enable constraint FK5FE498D34995ABCE');
+    
+    -------------------------------
+    -- FORUMS y CORREO INTERNO
+    -------------------------------
+    dbms_utility.exec_ddl_statement('alter table SAKAI.MFR_PVT_MSG_USR_T disable constraint FKC4DE0E14FA8620E');
+    --la dejamos deshabilitada mientas dure el borrado dbms_utility.exec_ddl_statement('alter table SAKAI.MFR_MEMBERSHIP_ITEM_T disable constraint FKE03761CB925CE0F4');
+    delete_messages(v_siteid);
+    
+    delete_forums(v_siteid);
+    dbms_utility.exec_ddl_statement('alter table SAKAI.MFR_PVT_MSG_USR_T enable constraint FKC4DE0E14FA8620E');
+    --la dejamos deshabilitada mientas dure el borrado dbms_utility.exec_ddl_statement('alter table SAKAI.MFR_MEMBERSHIP_ITEM_T enable constraint FKE03761CB925CE0F4');
+    
+    --------------------------------------
+    -- WIKI
+    --------------------------------------
+    delete_wiki(v_siteid);
+    
+    --------------------------------------------
+    -- ALIAS
+    --------------------------------------------
+    delete_alias(v_siteid);
+    
+    --------------------------------------------
+    -- POLLS
+    --------------------------------------------
+    delete_polls(v_siteid);
+    
+    --------------------------------------------
+    -- SIGNUP
+    --------------------------------------------
+    --dbms_utility.exec_ddl_statement('alter table SAKAI.SIGNUP_SITES disable constraint FK_SIGNUP_MEETING_SITES');
+    delete_signup(v_siteid);
+    --dbms_utility.exec_ddl_statement('alter table SAKAI.SIGNUP_SITES enable constraint FK_SIGNUP_MEETING_SITES');
+    
+    ------------------------------------------------
+    -- LESSON_BUILDER
+    -------------------------------------------------
+    delete_lessonbuilder(v_siteid);
+    
+    -----------------------------------------------------
+    -- EVENTOS
+    -----------------------------------------------------
+    -- El borrado de datos antiguos se realiza por orden cronologico en el procedimiento 
+    -- SAK_GENERA_ALU.BORRAR_DATOS_HISTORICOS en el que solo se mantienen los datos de los ultimos 3 meses.
+    --delete_events(siteid);
+    
+    ---------------------------------------------------
+    -- SITESTATS
+    ---------------------------------------------------
+    delete_sitestats(v_siteid);
+    
+    ---------------------------------------------------------------
+    -- REALMS
+    ---------------------------------------------------------------
+    delete_realms(v_siteid);
+    
+    ----------------------------------------------
+    -- EXAMENES
+    ----------------------------------------------
+    delete_assessments(v_siteid);
+    
+    ----------------------------------------------
+    -- SITES
+    ----------------------------------------------
+    delete_site_data(v_siteid);
+    
+    ------------------------------------
+    -- Recursos
+    ------------------------------------
+    delete_resources(v_siteid);
+    
+    commit;
+    
+  EXCEPTION
+     WHEN OTHERS THEN
+       rollback;
+       -- Habilitamos constrains
+      dbms_utility.exec_ddl_statement('alter table SAKAI.GB_GRADEBOOK_T enable constraint FK7C870191F11270F8');
+      dbms_utility.exec_ddl_statement('alter table SAKAI.GB_GRADE_MAP_T enable constraint FKADE112256AB1529A');
+      dbms_utility.exec_ddl_statement('alter table SAKAI.MFR_PVT_MSG_USR_T enable constraint FKC4DE0E14FA8620E');
+      -- la dejamos deshabilitada mientras dure el borrado dbms_utility.exec_ddl_statement('alter table SAKAI.MFR_MEMBERSHIP_ITEM_T enable constraint FKE03761CB925CE0F4');
+      dbms_utility.exec_ddl_statement('alter table SAKAI.MELETE_COURSE_MODULE enable constraint FK5FE498D34995ABCE');
+      dbms_utility.exec_ddl_statement('alter table SAKAI.SIGNUP_SITES enable constraint FK_SIGNUP_MEETING_SITES');
+      
+      logs(v_siteid,'ERROR en delete_site:'||SQLERRM);  
+  END borrar_site;
+  
+END DELETE_SITE_CONTENT;
+/

@@ -2102,7 +2102,14 @@ CREATE OR REPLACE PACKAGE BODY DELETE_SITE_CONTENT AS
        and exists (select * from user_constraints c2 
                   where c2.constraint_name=c1.r_constraint_name
                     and c2.table_name='MFR_PERMISSION_LEVEL_T');    
-
+    --
+    if w_c_gradebook_t is null or
+       w_c_grade_map_t is null or
+       w_c_pvvt_msg_usr_t is null or
+       w_c_melete_course_module is null or
+       w_c_membership_item_t is null then
+      raise_application_error(-20001,'Falta averiguar el nombre de alguna constraint');
+    end if;
     ------------------------
     -- Borramos los anuncios
     ------------------------

@@ -96,15 +96,6 @@ end long_to_clob;
 END UTL_CONVERT;
 /
 
-CREATE OR REPLACE PACKAGE SAK_UTL_REFERENCIAS_PCK AS
-
-  PROCEDURE PROCESAR_TEXTO_REFERENCIAS(ent_tabla in VARCHAR2,ent_tipo in VARCHAR2,ent_site IN VARCHAR2,ent_codigo IN VARCHAR2, ent_lob IN CLOB, forzar IN VARCHAR2 DEFAULT 'N');
-  PROCEDURE PROCESAR_TODO;
-  FUNCTION obtener_site(w_clob in CLOB) RETURN VARCHAR2;
-  FUNCTION ExtraerSite(ent_url in varchar2) RETURN VARCHAR2;
-
-END SAK_UTL_REFERENCIAS_PCK;
-/
 CREATE OR REPLACE PACKAGE BODY SAK_UTL_REFERENCIAS_PCK AS
 
   FUNCTION obtener_site(w_clob in CLOB) RETURN VARCHAR2 IS
@@ -135,7 +126,7 @@ CREATE OR REPLACE PACKAGE BODY SAK_UTL_REFERENCIAS_PCK AS
        end if;
      END IF;
      --- Hay que desescapar los caracteres de la URL para que coincida con los de la Base de datos     
-     RETURN UTL_URL.UNESCAPE(w_rec);
+     RETURN UTL_URL.UNESCAPE(w_rec,'UTF-8');
   END ExtraerRecurso;
   
   -----Función que saca el codigo de site de la URL del recurso
@@ -202,6 +193,7 @@ CREATE OR REPLACE PACKAGE BODY SAK_UTL_REFERENCIAS_PCK AS
   BEGIN
     ---Primero comprobamos si el recurso referenciado existe
     SELECT count(*) INTO w_conta FROM content_resource where resource_id=ent_recurso;
+    -- TODO si no existe, puede que haya que escapar algunos caracteres html replace(replace(replace(replace(replace(recurso,'&aacute;','á'),'&eacute;','é'),'&iacute;','í'),'&oacute;','ó'),'&uacute;','ú')
     ---Ahora insertamos los datos en la tabla  
     BEGIN
       INSERT INTO SAK_UTL_REFERENCIAS (tabla,tipo,codigo,site_origen,site_destino,url,recurso,existe,fecha_alta)
@@ -551,8 +543,11 @@ BEGIN
      PROCESAR_REFERENCIAS(w_sql,'CLOB',FALSE,null);
      
      -- 125.000 registros --> 12 minutos
-     w_sql:='select ''ASSIGNMENT_CONTENT'' tabla, ''1'' tipo, sak_utl_referencias_pck.obtener_site(utl_convert.long_to_clob(rowid,''ASSIGNMENT_CONTENT'',''XML'')) site,content_id codigo,
-                    utl_convert.long_to_clob(rowid,''ASSIGNMENT_CONTENT'',''XML'') campo 
+-- antes del cambio de LONG a CLOB     
+--     w_sql:='select ''ASSIGNMENT_CONTENT'' tabla, ''1'' tipo, sak_utl_referencias_pck.obtener_site(utl_convert.long_to_clob(rowid,''ASSIGNMENT_CONTENT'',''XML'')) site,content_id codigo,
+--                    utl_convert.long_to_clob(rowid,''ASSIGNMENT_CONTENT'',''XML'') campo 
+--               from assignment_content a';
+     w_sql:='select ''ASSIGNMENT_CONTENT'' tabla, ''1'' tipo, sak_utl_referencias_pck.obtener_site(xml) site,content_id codigo, xml campo
                from assignment_content a';
               --where rownum<'||w_maxrows;       
      PROCESAR_REFERENCIAS(w_sql,'CLOB',TRUE,'instructions-html');
@@ -561,8 +556,11 @@ BEGIN
 ---CALENDAR
 --------------  
      -- 85.000 registros --> 7 minutos
-     w_sql:='select ''CALENDAR_EVENT'' tabla, ''1'' tipo,replace(replace(calendar_id,''/calendar/calendar/'',null),''/main'',null) site,event_id codigo,
-             utl_convert.long_to_clob(rowid,''CALENDAR_EVENT'',''XML'') campo from calendar_event';
+-- antes del cambio de LONG a CLOB     
+--     w_sql:='select ''CALENDAR_EVENT'' tabla, ''1'' tipo,replace(replace(calendar_id,''/calendar/calendar/'',null),''/main'',null) site,event_id codigo,
+--             utl_convert.long_to_clob(rowid,''CALENDAR_EVENT'',''XML'') campo from calendar_event';
+     w_sql:='select ''CALENDAR_EVENT'' tabla, ''1'' tipo,replace(replace(calendar_id,''/calendar/calendar/'',null),''/main'',null) site,event_id codigo, xml campo
+              from calendar_event';
              --where rownum<'||w_maxrows;  
      PROCESAR_REFERENCIAS(w_sql,'CLOB',TRUE,'CHEF:description-html',TRUE);
     
@@ -683,19 +681,32 @@ CREATE OR REPLACE PACKAGE BODY DELETE_SITE_CONTENT AS
   END delete_announcements;
 
   procedure delete_assignments(p_siteid VARCHAR2) IS
+    ini number;
+    fin number;
+    asi VARCHAR2(255);
+    asi_content VARCHAR2(255);
+    
+    p xmlparser.parser;
+    doc xmldom.DOMDocument;
+    nl xmldom.DOMNodeList;
+    len1 number;
+    len2 number;
+    n xmldom.DOMNode;
+    e xmldom.DOMElement;
+    nnm xmldom.DOMNamedNodeMap;
+    attrname varchar2(500);
+    attrval varchar2(500);
   BEGIN
     logs(p_siteid, 'Inicio borrado de tareas');
     
     -- Eliminamos el contenido de las tareas
-    open c_assign_assign(p_siteid);
-    loop
-        fetch c_assign_assign into assign_assign;
-        exit when c_assign_assign%NOTFOUND;
-        
-        ini := instr(assign_assign.xml, 'assignmentcontent="');
-        ini := instr(assign_assign.xml, '"', ini, 1);
-        fin := instr(assign_assign.xml, '"', ini, 2);
-        asi := substr(assign_assign.xml, ini+1, fin-(ini+1));
+    for reg in (
+      select xml from assignment_assignment where context = p_siteid
+    )loop
+        ini := instr(reg.xml, 'assignmentcontent="');
+        ini := instr(reg.xml, '"', ini, 1);
+        fin := instr(reg.xml, '"', ini, 2);
+        asi := substr(reg.xml, ini+1, fin-(ini+1));
         ini := instr(asi, '/');
         asi_content := '';
         while ini > 0 loop
@@ -703,12 +714,88 @@ CREATE OR REPLACE PACKAGE BODY DELETE_SITE_CONTENT AS
           ini := instr(asi, '/', ini+1);
         end loop;
         logs(p_siteid, 'Content_id = ' || asi_content);
-        DELETE FROM assignment_content WHERE content_id = asi_content;
-          
+        -- Eliminamos los adjuntos de la tarea
+        for reg2 in (
+          select xml
+            from assignment_content where content_id = asi_content)
+        loop
+          p := xmlparser.newParser;
+          xmlparser.parseclob(p,reg2.xml);
+          doc := xmlparser.getDocument(p);
+          -- get all elements
+          nl := xmldom.getElementsByTagName(doc, 'content');
+          len1 := xmldom.getLength(nl);
+          -- loop through elements
+          for j in 0..len1-1 loop
+             n := xmldom.item(nl, j);
+             e := xmldom.makeElement(n);
+             --dbms_output.put_line(xmldom.getTagName(e) || ':');
+             -- get all attributes of element
+             nnm := xmldom.getAttributes(n);
+            if (xmldom.isNull(nnm) = FALSE) then
+               len2 := xmldom.getLength(nnm);
+               -- loop through attributes
+               for i in 0..len2-1 loop
+                  n := xmldom.item(nnm, i);
+                  attrname := xmldom.getNodeName(n);
+                  if attrname like 'attachment%' then
+                    attrval := xmldom.getNodeValue(n);
+                    --dbms_output.put_line(' ' || attrname || ' = ' || attrval);
+                    insert into BORRAR_SITES_RESOURCES_FS(site_id,resource_id,file_path,tipo)
+                    select p_siteid, resource_id, 'rm ''sakai/'||substr(file_path, 2)||'''', 'C'
+                      from content_resource 
+                        where resource_id = substr(attrval,9);
+                  end if;
+               end loop;
+            end if;
+          end loop;
+          xmldom.freeDocument(doc);
+          xmlparser.freeParser(p);
+        end loop;
+        DELETE FROM assignment_content WHERE content_id = asi_content;         
     end loop;
-    close c_assign_assign;
     
     logs(p_siteid, 'borrado contenidos de tareas');
+    -- Eliminamos los adjuntos de los envios de las tareas
+    for reg in (
+       select xml
+         from assignment_submission where context in (
+           select assignment_id from assignment_assignment where context = p_siteid)
+    )loop
+      p := xmlparser.newParser;
+      xmlparser.parseclob(p,reg.xml);
+      doc := xmlparser.getDocument(p);
+      -- get all elements
+      nl := xmldom.getElementsByTagName(doc, 'submission');
+      len1 := xmldom.getLength(nl);
+      -- loop through elements
+      for j in 0..len1-1 loop
+         n := xmldom.item(nl, j);
+         e := xmldom.makeElement(n);
+         --dbms_output.put_line(xmldom.getTagName(e) || ':');
+         -- get all attributes of element
+         nnm := xmldom.getAttributes(n);
+        if (xmldom.isNull(nnm) = FALSE) then
+           len2 := xmldom.getLength(nnm);
+           -- loop through attributes
+           for i in 0..len2-1 loop
+              n := xmldom.item(nnm, i);
+              attrname := xmldom.getNodeName(n);
+              if attrname like 'submittedattachment%' then
+                attrval := xmldom.getNodeValue(n);
+                --dbms_output.put_line(' ' || attrname || ' = ' || attrval);
+                insert into BORRAR_SITES_RESOURCES_FS(site_id,resource_id,file_path,tipo)
+                select p_siteid, resource_id, 'rm ''sakai/'||substr(file_path, 2)||'''', 'C'
+                  from content_resource 
+                    where resource_id = substr(attrval,9);
+              end if;
+           end loop;
+        end if;
+      end loop;
+      xmldom.freeDocument(doc);
+      xmlparser.freeParser(p);
+    end loop;
+
     -- Eliminamos los envios de las tareas
     delete from assignment_submission where context in
     (

@@ -65,7 +65,6 @@ update BORRAR_SITES_RESOURCES_FS
 /////////////
 A tener en cuenta
 
--La UPV tiene todavía campos LONG, puede que esto falle
 -La deshabilitación de las constraints se hace por nombre.
 Como cada instalación puede tener diferentes nombres de constraint, habría que adaptar el nombre.
 -Los sites que son de usuario no empiezan por '~' en la tabla sak_utl_referencias
